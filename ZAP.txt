@@ -1,0 +1,264 @@
+ZAP — what makes flux fast, snappy and smooth
+=============================================
+Prep notes for a new spinoff: a QuickLook-style previewer (press space → see the image,
+text, HTML, video… instantly). Distilled from the flux codebase (Rust, GTK4 0.11 /
+libadwaita 1.4 / relm4 0.11). Paths are flux paths to crib from. Numbers in quotes come
+from flux's own code comments or commit messages, not from new measurements.
+
+Sections marked [PREVIEWER] are recommendations for the new tool, not things flux does.
+
+
+0. THE FIVE RULES
+-----------------
+1. Show first, work after. The window (and a placeholder) is on screen before any I/O.
+2. The GTK thread never waits: no syscalls, decoding, sorting or config reads in UI code.
+3. Every piece of async work carries a session id; anything that comes back late is
+   dropped on arrival.
+4. Read and decode only what's visible (viewport, first bytes, header-only probes).
+5. Measure it. A 16 ms main-thread budget is tracked per code path; regressions are
+   caught by tooling, and the worst ones by asserts.
+
+
+1. STARTING INSTANTLY
+---------------------
+- NO application_id, NO NON_UNIQUE flag on the main adw::Application.
+  Setting either "triggers a synchronous D-Bus handshake and Wayland compositor lookup
+  that blocks the main thread for around ~200ms". flux enforces this with runtime
+  asserts that print "STARTUP REGRESSION".                       src/cli/launch.rs:28-50
+  Trade-off: every launch is its own process (no single-instance forwarding).
+  (flux's own --file-properties viewer uses an app id and still pays this.)
+
+- Size the window BEFORE it is mapped (connect_window_added, while !is_mapped()):
+  set size_request + default size. Otherwise it maps at libadwaita's 360x200 default, or a
+  later resize "overrides the compositor's tile size" on tiling WMs (niri, sway…).
+                                                    src/cli/launch.rs:58-70,
+                                                    src/ui/view/init.rs:404-408, 585-593
+
+- Base CSS compiled in: relm4::set_global_css(include_str!("style.css")). No disk read
+  for the first frame. Themes/user CSS are applied 150 ms later.
+                                     src/ui/startup/components.rs:31-34, src/cli/launch.rs:19-26
+
+- Load resources in parallel, await the slow one last: config + menu are awaited; the
+  SQLite DB opens in the background as a PendingDb while the UI is built, and is only
+  awaited when needed.          src/ui/startup/resources.rs:21-46, src/ui/startup/components.rs:92-93
+
+- Defer I/O until after the first frame (75 ms): DB scrub, font warm-up, sidebar,
+  first directory read. "Removing or shortening this timeout adds ~30-55ms of
+  synchronous stall to cold/warm startup."                     src/ui/startup/deferred.rs:28-61
+
+- Warm expensive one-time lookups off the main thread (OnceLock): e.g. fontconfig for the
+  Nerd Font, otherwise the first bind that needs it stalls.       src/ui/startup/deferred.rs:45-49
+  Commit dee626c: "~118ms initial icon theme lookup freeze" fixed the same way.
+
+- Build rarely used UI lazily (side panels on first toggle, background tabs on first
+  select).          src/utils/helpers/sidebar.rs:266-290, src/ui/tabs/lifecycle.rs:79-80, 118
+
+- mimalloc as global allocator.                                          src/main.rs:8-9
+
+[PREVIEWER] Spacebar must feel like < 100 ms to pixels. A cold GTK process won't reliably
+do that, even when it's lean. Options, in order of snappiness:
+  a) resident daemon with a pre-built, hidden window; space = show + set content
+     (keep the window, hide it on close, never destroy it);
+  b) single-instance via a unix socket of your own (not GApplication D-Bus, see the
+     ~200ms above);
+  c) plain cold start following everything in this section.
+Show the window with the file name + icon/thumbnail from cache immediately, then swap in
+the full preview.
+
+
+2. THE MAIN THREAD NEVER WAITS
+------------------------------
+- Pre-warm lazy metadata on worker threads. flux's load items have OnceLock getters
+  (size, mtime, owner); calling them first on the GTK thread meant "With a batch of ~90
+  items that's roughly 180 syscalls serialized inside the event loop. Before this fix
+  each FolderLoadedChunk spent ~40ms on that". Now they're forced inside the rayon pool.
+                                         src/services/loader/directory.rs:443-463,
+                                         src/model/file_load.rs:31-36, 72-181
+
+- A small, capped worker pool instead of rayon's global one: 4-8 threads, 2 MiB stacks.
+  "prevents the one-time ~50 MiB RSS jump that occurs when the global pool fully commits
+  its stacks."                                           src/services/loader/pool.rs:1-23
+
+- Read directories without stat(): ignore::WalkBuilder max_depth(1) build_parallel, take
+  the file type from the dirent; stat only what's needed (symlinks).
+                                                src/services/loader/directory.rs:265-350
+
+- Precompute sort keys (lowercased name, extension) once, in parallel; sort with
+  par_sort_unstable_by inside the same pool.         src/services/loader/directory.rs:355-508
+
+- Feed the UI in small idle chunks: first batch synchronously, the rest one chunk per
+  glib::idle_add_local. Batch size 10: "At 50 items each idle callback ran long enough to
+  block the main loop, 10 keeps each chunk short" (commit 446e23e).
+                                                  src/services/loader/streaming.rs:365-407
+
+- Spinner only after 150 ms (and only if that load is still current): fast loads never
+  flash.                       src/services/loader/directory.rs:257-262, streaming.rs:13-17
+
+- Results come back as messages (relm4 sender; a global SENDER OnceLock lets non-UI code
+  post), or via a slot (Arc<Mutex<Option<T>>>) polled every 50 ms with take().
+                                  src/ui/startup/components.rs:30, src/ui/dialog/inspector.rs:121-140
+
+- Log slow handlers: any AppMsg taking > 32 ms is printed as [slow AppMsg].
+                                                           src/ui/update/mod.rs:124-140
+
+- Cache hot config values on the item instead of reading config in bind ("avoids a
+  config.toml read per bind() call").                     src/ui/components/file_item.rs:54-57
+
+
+3. KILL STALE WORK
+------------------
+Most important for a previewer: users hold the arrow key and fly through files.
+
+- One Arc<AtomicU64> session id (load_id). Bump it on every new load/search; every async
+  hop checks it: before work, after acquiring a permit, after decoding, on arrival in
+  the UI. Pending idle chunks are dropped the moment it changes ("free all pending item
+  data immediately").        src/services/loader/directory.rs:165, streaming.rs:242-250, 385-387
+- gio::Cancellable for walks; the walker returns WalkState::Quit on session mismatch.
+                                                 src/services/search/extension.rs:157-161, 504-509
+- Per-item AtomicBool cancel tokens for thumbnails, set when items scroll out of view;
+  clearing them all happens off the UI thread (commit 929498c).
+                                  src/services/thumbnails/manager.rs:10-66, directory.rs:167-170
+- On arrival, validate the target still exists and is the same slot (index matches the
+  item), else drop.                                  src/ui/ops/view/thumbnails.rs:68-114
+
+[PREVIEWER] Debounce rapid next/prev (render after ~30-50 ms idle), but show the cached
+thumbnail right away so it never looks stuck.
+
+
+4. IMAGES, THUMBNAILS, MEDIA
+----------------------------
+- Reuse the freedesktop thumbnail cache (~/.cache/thumbnails, md5(file:// URI).png,
+  normal/large/x-large/xx-large; fall back across sizes; stale if source mtime is newer).
+  Shared with GNOME etc., so it's often warm before you ever run.
+                                                     src/utils/media/thumbnail.rs:31-213
+- Decode in spawn_blocking, never on the GTK thread.             thumbnail.rs:31-47
+- Concurrency = min(threads, RLIMIT_NOFILE/4) via a semaphore: "Each thumbnail holds a
+  couple of fds".                     src/services/thumbnails/permits.rs:7-23, batch.rs:24-31
+- Viewport-driven: only visible items (+ overscan 30) get work; scroll debounced 20 ms;
+  duplicate requests deduped.    src/ui/ops/view/thumbnails.rs:9-258, src/ui/view/component.rs:20-52
+- Header-only probes before decoding: imagesize for dimensions, caps at 512 MiB files and
+  65536 px, magic-byte check, because "glycin can `realloc` gigabytes on a malformed
+  header before the RSS watchdog notices."              src/utils/media/image.rs:79-166
+- PDF via poppler page 0 → cairo surface → texture directly (no PNG round trip).
+                                                                 src/utils/media/pdf.rs
+- Video:
+  * Check GStreamer can play (gstreamer::init + ElementFactory::find("playbin3"), once,
+    OnceLock) BEFORE creating a GtkMediaFile; without it GTK aborts the whole process.
+                                                  src/ui/ops/view/video_preview.rs:16-38
+  * Use MediaFile as a paintable on an existing Image, not gtk::Video, which "would size
+    itself to the video's resolution and reflow the whole grid".     video_preview.rs:76-80
+  * Keep showing the thumbnail until the first frame arrives (connect_invalidate_contents);
+    swapping immediately "shows an empty icon until playback has started".  :295-319
+  * Rate-limit launches (5/s, then a 5 s cooldown).                         :12-14, 201-221
+- Video stills: ffmpeg -ss <t> -vframes 1 -an -vf scale=…, retry at 0 s.
+                                                               src/utils/media/video.rs:47-118
+- Fonts: register per-process (FcConfigAppFontAddFile), render with PangoCairo.
+                                                                  src/utils/media/font.rs
+
+Do NOT copy (flux anti-patterns found while distilling):
+- oxipng + writing a PNG + reading it back before display (image.rs:11-43). Display path
+  should go decode → gdk::MemoryTexture directly; write the cache asynchronously.
+- load_config() per video thumbnail (video.rs:53); use the cached config.
+- No Thumb::MTime / Thumb::URI written (oxipng strips chunks), so other apps can't
+  validate flux's thumbnails. Write the spec's tEXt chunks.
+- No per-texture LRU (only whole-folder eviction).
+
+
+5. RENDERING / GTK SPECIFICS
+----------------------------
+- Recycling views (GtkGridView/ListView via relm4 TypedGridView): build widgets once in
+  setup, only mutate them in bind, clean up in unbind (pause video, drop texture).
+                       src/ui/components/setup.rs:19, bind.rs:283, 789-863
+- bind must be trivial: no config reads, no syscalls, and NO set_widget_name(): it "forces
+  GTK's style engine to re-run a full CSS selector match for the entire grid on every
+  bind, which caused severe scrollbar lag". Use set_data instead.  bind.rs:503-509
+  (commit b63a413)
+- Reserve space for data that arrives later (fixed cell heights) so nothing reflows when
+  stats/thumbnails land.                                               bind.rs:114-116
+- Bulk updates in one model change: ListStore::splice(0, n, items) instead of n×
+  remove+insert (one items-changed, one layout). Save/restore selection (Bitset) and the
+  scroll fraction around it.                       src/ui/ops/view/layout.rs (set_icon_size)
+- Accumulate scroll deltas: a mouse wheel notch is ±1, a touchpad sends many tiny ones;
+  step only when the sum crosses 1.            src/ui/view/component.rs (Ctrl+scroll zoom)
+- Layout that depends on available width: measure in a tick callback, act only when the
+  number changed, add hysteresis so it doesn't flap. GTK caches measurements, so it's a
+  few lookups per frame.        src/ui/list_columns.rs:396-426, src/ui/view/path_bar.rs
+- libadwaita applies only ONE breakpoint at a time; overlapping ones unapply each other.
+                                                               src/ui/view/init.rs:394-455
+- Input: a ShortcutController with Global scope that only posts messages; a capture-phase
+  key controller that yields to editable widgets and the terminal.
+                               src/ui/inputs/shortcuts.rs:16-32, src/ui/inputs/capture.rs:8-17
+
+
+6. READ LESS, CAP EVERYTHING
+----------------------------
+- Read only what you show: properties reads the first 1 MiB; MIME sniff reads 4 KiB then
+  gio::content_type_guess.          src/ui/properties/window.rs:82, src/utils/media/mime.rs:91-148
+- Hard caps: content search skips files > 128 MiB; folder scans stop at 10,000 entries
+  and mark the result "≥"; cached thumbnails > 1 MiB are discarded.
+                    src/services/search/scan.rs:7, src/services/thumbnails/folder.rs:20, 137-174
+- Classify by extension first (no I/O), sniff only when needed.
+                                         src/services/thumbnails/folder.rs:76-104, mime.rs:155-181
+- Watchers: debounce per path (500 ms; "A 30 MB download emits dozens of `Changed`
+  events"), update the one item in place, ignore partial downloads (.part siblings).
+                                                         src/ui/ops/watcher.rs:11-117, 184-302
+- Indexes: SQLite WAL + synchronous=NORMAL + 256 MiB mmap; FTS5 trigram; skip huge system
+  trees (/nix: "tens of millions of files"); delta scans by directory mtime (ns); an
+  AtomicBool "ready" flag because the search box asks on every keystroke.
+                                            src/services/search/indexer.rs:22-36, 186-190, 612-615
+
+
+7. [PREVIEWER] BLUEPRINT
+------------------------
+Built from the above; recommendations, not flux facts.
+- Window: borderless/centred overlay, sized before map, hidden (not destroyed) on close;
+  space / Esc toggles; arrows = prev/next in the caller's selection.
+- Pipeline per file: session id++ → show name + cached freedesktop thumbnail immediately →
+  sniff type (extension, then 4 KiB) → decode on a capped pool → arrival check → swap in.
+- Images: decode to the window size, not full res (glycin / image crate with a
+  scale-on-decode, or pixbuf from_file_at_scale), upload as gdk::MemoryTexture; header
+  probe + caps first; full res only on zoom.
+- Text/code: read the first N KiB (e.g. 512 KiB), show plain text at once, apply syntax
+  highlighting afterwards on a worker for the visible part only; say "showing first
+  512 KiB" when truncated. Detect binary (NUL bytes in the sniff) and fall back to a hex
+  or info view.
+- HTML/Markdown: WebKitGTK is heavy to spin up. Keep one WebView warm in the daemon, or
+  render Markdown to GTK text / a lightweight HTML view; disable JS and network by
+  default (it's a preview, files can be hostile).
+- Video/audio: playbin3 check first; MediaFile as a paintable; thumbnail until first frame.
+- PDF: poppler page 1 straight to texture; more pages lazily.
+- Neighbours: when showing file i, prefetch i±1 at low priority; keep a small LRU of
+  decoded textures (bounded by bytes, not count).
+- Never trust the file: size caps, dimension caps, timeouts on external tools (ffmpeg,
+  exiftool), and a crash in a decoder must not take the window down (subprocess for the
+  risky formats).
+
+
+8. TOOLING TO COPY ON DAY ONE
+-----------------------------
+- hit!() probe macro: one static probe per call site, RAII guard, lock-free relaxed
+  atomics: count, total/self time, min/max, log2 histogram (p50/p95/p99), main-thread
+  calls over the 16 ms budget, peak in-flight. Compiles to nothing in release. atexit
+  dump + JSON via FLUX_HWGA_OUT=auto|path.  src/utils/hwga/ (macros.rs:10-25, probe.rs,
+                                                             guard.rs, globals.rs:8, monitor.rs)
+- [slow AppMsg] logging (> 32 ms per message).                src/ui/update/mod.rs:124-140
+- A debug window (flux: Ctrl+Shift+F7): RSS/VmData, smaps, mallinfo, threads, fds, probe
+  snapshot, mi_collect.                                   src/ui/debug/ (ffi.rs:3-37)
+- Startup regression asserts for things that silently cost 100s of ms (app id, flags).
+- Add a real release profile; flux has none (only [profile.local], opt-level 2):
+      [profile.release]
+      lto = "fat"
+      codegen-units = 1
+      panic = "abort"
+      opt-level = 3
+- Pin GTK feature levels deliberately (flux: gtk v4_8, adw v1_4); newer APIs
+  (e.g. GridView::scroll_to, Widget::color) need higher features.
+
+
+9. CRATES WORTH REUSING
+-----------------------
+gtk4 0.11 / libadwaita 0.9 / relm4 0.11, glib+gio 0.22, gdk-pixbuf, pango/pangocairo,
+rayon (capped pool), tokio (spawn_blocking), futures (buffer_unordered), ignore (parallel
+walk), globset, aho-corasick, nucleo (fuzzy), rusqlite (bundled, WAL), memmap2,
+parking_lot, imagesize (header probes), poppler (render), lofty (audio tags/cover),
+gstreamer (capability check only), fontconfig, mimalloc.
