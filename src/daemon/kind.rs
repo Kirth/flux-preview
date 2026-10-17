@@ -11,6 +11,7 @@ pub enum Kind {
     Pdf,
     Video,
     Audio,
+    Archive,
     Binary,
     Unknown,
 }
@@ -26,6 +27,7 @@ impl Kind {
             Kind::Pdf => "PDF",
             Kind::Video => "Video",
             Kind::Audio => "Audio",
+            Kind::Archive => "Archive",
             Kind::Binary => "Binary",
             Kind::Unknown => "File",
         }
@@ -48,6 +50,25 @@ impl Kind {
             ("image", _) => Kind::Image,
             ("video", _) => Kind::Video,
             ("audio", _) => Kind::Audio,
+            (
+                "application",
+                "zip"
+                | "x-zip-compressed"
+                | "java-archive"
+                | "x-7z-compressed"
+                | "x-tar"
+                | "x-compressed-tar"
+                | "x-rar"
+                | "x-rar-compressed"
+                | "vnd.rar"
+                | "gzip"
+                | "x-bzip2"
+                | "x-xz"
+                | "zstd"
+                | "x-lz4"
+                | "x-iso9660-image"
+                | "vnd.debian.binary-package",
+            ) => Kind::Archive,
             _ => return None,
         })
     }
@@ -70,6 +91,12 @@ pub fn from_extension(path: &Path) -> Option<Kind> {
         | "hpp" | "go" | "java" | "kt" | "js" | "mjs" | "ts" | "tsx" | "jsx" | "css" | "scss"
         | "sh" | "bash" | "zsh" | "fish" | "nix" | "lua" | "rb" | "pl" | "sql" | "diff"
         | "patch" | "lock" | "srt" | "vtt" => Kind::Text,
+        // `foo.tar.gz` lands here as `gz`; the loader sniffs tar vs. single file.
+        "zip" | "jar" | "war" | "apk" | "aar" | "cbz" | "whl" | "xpi" | "vsix" | "nupkg"
+        | "ipa" | "7z" | "rar" | "cbr" | "tar" | "tgz" | "tbz" | "tbz2" | "txz" | "tlz"
+        | "tzst" | "gz" | "bz2" | "xz" | "lzma" | "zst" | "zstd" | "lz4" | "iso" | "deb" => {
+            Kind::Archive
+        }
         _ => return None,
     })
 }

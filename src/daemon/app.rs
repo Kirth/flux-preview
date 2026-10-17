@@ -415,6 +415,16 @@ impl App {
             Payload::Video => self.views.show_video(&path),
             Payload::Audio(info) => self.views.show_audio(&path, &info),
             Payload::Html => self.views.show_html(&path),
+            Payload::Archive(listing) => {
+                self.summary.push(listing.format.clone());
+                let files = listing.tree.root().files;
+                self.summary.push(format!(
+                    "{} file{}",
+                    load::group_digits(files),
+                    if files == 1 { "" } else { "s" }
+                ));
+                self.views.show_archive(*listing);
+            }
             Payload::Info => self.views.show_info(&path, meta, None),
             Payload::Error(err) => self.views.show_info(&path, meta, Some(&err)),
         }

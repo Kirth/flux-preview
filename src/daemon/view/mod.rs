@@ -1,6 +1,7 @@
 //! The preview pages, in one `gtk::Stack`. Each page is built on first use and then kept
 //! and reused for every later file of that kind (ZAP §1: build rarely used UI lazily).
 
+mod archive;
 mod image;
 mod info;
 mod media;
@@ -9,13 +10,14 @@ mod web;
 mod zoom;
 
 use crate::app::{AppMsg, PageCmd};
-use crate::load::{AudioInfo, Meta};
+use crate::load::{AudioInfo, Listing, Meta};
 use gtk::gdk;
 use std::path::Path;
 
+use archive::ArchivePage;
 use image::ImagePage;
 use info::InfoPage;
-pub use info::format_size;
+pub use info::{format_size, format_unix};
 use media::{AudioPage, VideoPage};
 use text::TextPage;
 use web::WebPage;
@@ -35,6 +37,7 @@ pub struct Views {
     video: Option<VideoPage>,
     audio: Option<AudioPage>,
     web: Option<WebPage>,
+    archive: Option<ArchivePage>,
     info: Option<InfoPage>,
 }
 
@@ -71,6 +74,7 @@ impl Views {
             video: None,
             audio: None,
             web: None,
+            archive: None,
             info: None,
         }
     }
@@ -176,6 +180,10 @@ impl Views {
 
     pub fn show_html(&mut self, path: &Path) {
         page(&self.stack, &mut self.web).load(path);
+    }
+
+    pub fn show_archive(&mut self, listing: Listing) {
+        page(&self.stack, &mut self.archive).set(listing);
     }
 
     pub fn show_info(&mut self, path: &Path, meta: &Meta, error: Option<&str>) {

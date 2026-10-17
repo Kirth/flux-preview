@@ -4,7 +4,12 @@ QuickLook for Linux: press space in a file manager, see the file. A spinoff of f
 rules in [ZAP.txt](ZAP.txt).
 
 Previews images, text, HTML (WebKitGTK, JS and network off), PDF (page by page), video and audio
-(GStreamer), with an info page for everything else.
+(GStreamer), archive contents, with an info page for everything else.
+
+Archives show a summary (files, folders, unpacked size, ratio, encryption) and an expandable
+tree, read-only: nothing is extracted. zip and zip-based files (jar, apk, cbz, whl…), tar in any
+compression, 7z, single `.gz/.xz/.bz2/.zst/.lz4` files, ISO 9660 and .deb are read in-process.
+RAR needs `unrar` (or `7z` with RAR support) and UDF images need `7z`, on `$PATH`.
 
 ## Use
 
@@ -41,6 +46,9 @@ Images and PDFs zoom and pan:
   through files is debounced by 40 ms.
 - **Off the GTK thread.** Sniffing, decoding (images scaled to the window), PDF rendering, tags and
   cover art all run on a capped pool. The UI thread only uploads `MemoryTexture`s.
+- **Archives list, never unpack.** zip, 7z and ISO read only their directories. Compressed
+  tarballs have to be decompressed to be listed, so they stop after 3 s or 200k entries and say
+  so; external listers are killed after 10 s or when you move on.
 - **Sharper only when zoomed.** Zoom is one transform in `snapshot()`, never a relayout. 150 ms
   after zooming stops, if the screen shows more pixels than the texture has, the full image
   (≤ 64 MP) or a re-render of the page (≤ 8192 px) replaces it in place. Page flips and zoom
@@ -56,8 +64,8 @@ Images and PDFs zoom and pan:
 src/main.rs, cli.rs, ipc.rs   client + shared std-only lib
 src/daemon/main.rs, app.rs    daemon entry, relm4 window component
 src/daemon/kind.rs            extension → 4 KiB sniff classification
-src/daemon/load/              pool-side loaders (image, text, pdf, audio)
-src/daemon/view/              lazily built pages (image, text, media, web, info); zoom.rs
+src/daemon/load/              pool-side loaders (image, text, pdf, audio, archive/)
+src/daemon/view/              lazily built pages (image, text, media, web, archive, info); zoom.rs
 src/daemon/thumbcache.rs      freedesktop thumbnail lookup
 src/daemon/hwga/              probes copied from flux
 ```

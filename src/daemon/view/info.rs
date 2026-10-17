@@ -61,6 +61,11 @@ pub fn format_size(bytes: u64) -> String {
 
 fn format_time(time: std::time::SystemTime) -> Option<String> {
     let secs = time.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
-    let dt = glib::DateTime::from_unix_local(secs as i64).ok()?;
+    format_unix(secs as i64)
+}
+
+/// `YYYY-MM-DD HH:MM`, local time.
+pub fn format_unix(secs: i64) -> Option<String> {
+    let dt = glib::DateTime::from_unix_local(secs).ok()?;
     dt.format("%Y-%m-%d %H:%M").ok().map(|s| s.to_string())
 }

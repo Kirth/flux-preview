@@ -1,11 +1,13 @@
 //! Off-thread loading. Everything here runs on the capped pool, never the GTK thread;
 //! results go back to the UI as `AppMsg`s and are dropped there if the session moved on.
 
+mod archive;
 mod audio;
 mod image;
 mod pdf;
 mod text;
 
+pub use archive::{Listing, Node, Tree, group_digits};
 pub use audio::AudioInfo;
 pub use pdf::Target;
 pub use text::TEXT_CAP;
@@ -92,6 +94,7 @@ pub enum Payload {
     Video,
     Html,
     Audio(AudioInfo),
+    Archive(Box<Listing>),
     /// No preview for this kind; show the info page.
     Info,
     /// The preview failed or was refused (caps, missing GStreamer, ...).
@@ -135,6 +138,9 @@ pub fn spawn(job: Job, session: Session, sender: relm4::Sender<AppMsg>) {
         let result = match kind {
             Kind::Image => image::load(&path, target),
             Kind::Pdf => pdf::render(&path, 0, Target::Fit(target)),
+            Kind::Archive => {
+                archive::load(&path, &session, id).map(|l| Payload::Archive(Box::new(l)))
+            }
             Kind::Text => text::load(&path),
             Kind::Audio => Ok(Payload::Audio(audio::load(&path))),
             Kind::Video if !playback_available() => Err(NO_GSTREAMER.into()),
