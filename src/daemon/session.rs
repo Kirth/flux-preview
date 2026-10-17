@@ -14,6 +14,10 @@ impl Session {
         self.0.fetch_add(1, Ordering::AcqRel) + 1
     }
 
+    pub fn current(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
+
     pub fn is_current(&self, id: u64) -> bool {
         self.0.load(Ordering::Acquire) == id
     }

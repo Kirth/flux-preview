@@ -7,6 +7,7 @@ mod pdf;
 mod text;
 
 pub use audio::AudioInfo;
+pub use pdf::Target;
 pub use text::TEXT_CAP;
 
 use crate::app::AppMsg;
@@ -31,6 +32,10 @@ pub struct Pixels {
 }
 
 impl Pixels {
+    pub fn width(&self) -> i32 {
+        self.width
+    }
+
     pub fn texture(&self) -> gdk::Texture {
         gdk::MemoryTexture::new(
             self.width,
@@ -73,7 +78,11 @@ pub enum Payload {
     },
     Pdf {
         page: Pixels,
+        /// 0-based.
+        index: i32,
         pages: i32,
+        /// In PDF points.
+        size: (f64, f64),
     },
     Text {
         text: String,
@@ -125,7 +134,7 @@ pub fn spawn(job: Job, session: Session, sender: relm4::Sender<AppMsg>) {
         }
         let result = match kind {
             Kind::Image => image::load(&path, target),
-            Kind::Pdf => pdf::load(&path, target),
+            Kind::Pdf => pdf::render(&path, 0, Target::Fit(target)),
             Kind::Text => text::load(&path),
             Kind::Audio => Ok(Payload::Audio(audio::load(&path))),
             Kind::Video if !playback_available() => Err(NO_GSTREAMER.into()),
@@ -141,6 +150,61 @@ pub fn spawn(job: Job, session: Session, sender: relm4::Sender<AppMsg>) {
                 kind,
                 meta,
                 payload,
+            });
+        }
+    });
+}
+
+/// Sharper or further pixels for the file on screen.
+pub enum Detail {
+    /// The image at full resolution, for zooming in.
+    Full,
+    Page {
+        index: i32,
+        target: Target,
+    },
+}
+
+pub struct DetailJob {
+    pub id: u64,
+    /// The view generation: page flips and zooms bump it, dropping older renders.
+    pub generation: u64,
+    pub path: PathBuf,
+    pub detail: Detail,
+    /// Passed back untouched: the direction of the page flip this render is for.
+    pub flip: Option<i32>,
+}
+
+/// Decodes `job` on the pool, then posts `AppMsg::Detail`.
+pub fn spawn_detail(
+    job: DetailJob,
+    session: Session,
+    generations: Session,
+    sender: relm4::Sender<AppMsg>,
+) {
+    pool().spawn(move || {
+        let DetailJob {
+            id,
+            generation,
+            path,
+            detail,
+            flip,
+        } = job;
+        let current = || session.is_current(id) && generations.is_current(generation);
+        if !current() {
+            return;
+        }
+        crate::hit!("detail");
+        let result = match detail {
+            Detail::Full => image::load_full(&path),
+            Detail::Page { index, target } => pdf::render(&path, index, target),
+        };
+        if current() {
+            sender.emit(AppMsg::Detail {
+                id,
+                generation,
+                flip,
+                payload: result.unwrap_or_else(Payload::Error),
             });
         }
     });

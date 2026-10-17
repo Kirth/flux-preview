@@ -3,7 +3,7 @@
 QuickLook for Linux: press space in a file manager, see the file. A spinoff of flux, built on the
 rules in [ZAP.txt](ZAP.txt).
 
-Previews images, text, HTML (WebKitGTK, JS and network off), PDF (page 1), video and audio
+Previews images, text, HTML (WebKitGTK, JS and network off), PDF (page by page), video and audio
 (GStreamer), with an info page for everything else.
 
 ## Use
@@ -16,6 +16,17 @@ target/release/flux-preview --index 2 a.png b.txt c.pdf   # toggle the preview o
 
 Keys: <kbd>Space</kbd>/<kbd>Esc</kbd> hide, <kbd>←</kbd>/<kbd>→</kbd> previous/next file,
 <kbd>Enter</kbd> open in the default app, <kbd>Ctrl</kbd>+<kbd>Q</kbd> quit the daemon.
+
+Images and PDFs zoom and pan:
+
+| | Images | PDFs |
+|---|---|---|
+| Zoom | wheel, pinch, <kbd>+</kbd>/<kbd>-</kbd> | <kbd>Ctrl</kbd>+wheel, pinch, <kbd>+</kbd>/<kbd>-</kbd> |
+| Fit / 100% | <kbd>0</kbd> / <kbd>1</kbd>, double-click toggles | same (double-click: fit ↔ 2×) |
+| Pan | drag, touchpad scroll, <kbd>↑</kbd><kbd>↓</kbd> <kbd>j</kbd><kbd>k</kbd>, <kbd>Shift</kbd>+<kbd>←</kbd><kbd>→</kbd> | drag, wheel, same keys |
+| Pages | | <kbd>PgUp</kbd>/<kbd>PgDn</kbd>, <kbd>Home</kbd>/<kbd>End</kbd>, scroll past the edge |
+
+<kbd>←</kbd>/<kbd>→</kbd> always switch files, zoomed or not.
 
 ## How it stays fast
 
@@ -30,6 +41,10 @@ Keys: <kbd>Space</kbd>/<kbd>Esc</kbd> hide, <kbd>←</kbd>/<kbd>→</kbd> previo
   through files is debounced by 40 ms.
 - **Off the GTK thread.** Sniffing, decoding (images scaled to the window), PDF rendering, tags and
   cover art all run on a capped pool. The UI thread only uploads `MemoryTexture`s.
+- **Sharper only when zoomed.** Zoom is one transform in `snapshot()`, never a relayout. 150 ms
+  after zooming stops, if the screen shows more pixels than the texture has, the full image
+  (≤ 64 MP) or a re-render of the page (≤ 8192 px) replaces it in place. Page flips and zoom
+  renders carry their own generation id on top of the session id.
 - **Lazy pages.** Each viewer is built the first time it's needed. The WebView is warmed 75 ms
   after startup.
 - **Measured.** `hit!()` probes from flux (`FLUX_PREVIEW_HWGA_OUT=auto|path`, debug builds), and
@@ -42,7 +57,7 @@ src/main.rs, cli.rs, ipc.rs   client + shared std-only lib
 src/daemon/main.rs, app.rs    daemon entry, relm4 window component
 src/daemon/kind.rs            extension → 4 KiB sniff classification
 src/daemon/load/              pool-side loaders (image, text, pdf, audio)
-src/daemon/view/              lazily built pages (image, text, media, web, info)
+src/daemon/view/              lazily built pages (image, text, media, web, info); zoom.rs
 src/daemon/thumbcache.rs      freedesktop thumbnail lookup
 src/daemon/hwga/              probes copied from flux
 ```
@@ -60,7 +75,9 @@ src/daemon/hwga/              probes copied from flux
 - Neighbour prefetch (i±1) + byte-bounded texture LRU
 - Keep the thumbnail on screen until the first video frame arrives
 - Syntax highlighting (gtksourceview5) and Markdown rendering
-- PDF page navigation; full-resolution images on zoom; animated GIF/WebP
+- Animated GIF/WebP
+- PDF: prefetch pages n±1; keep the `PopplerDocument` open between renders
+- Tiled rendering for zooms past the 64 MP / 8192 px caps
 - Replace the dead-proxy network block with a compiled WebKit content filter
 - Validate thumbnails via `Thumb::MTime`
 - flux integration: call `flux-preview --index N <selection>` on space
