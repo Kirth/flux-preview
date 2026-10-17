@@ -9,7 +9,7 @@ mod text;
 mod web;
 mod zoom;
 
-use crate::app::{AppMsg, PageCmd};
+use crate::app::AppMsg;
 use crate::load::{AudioInfo, Listing, Meta};
 use gtk::gdk;
 use std::path::Path;
@@ -105,7 +105,11 @@ impl Views {
             let s = self.sender.clone();
             view.connect_detail_wanted(move |w, h| s.emit(AppMsg::DetailWanted(w, h)));
             let s = self.sender.clone();
-            view.connect_page_edge(move |dir| s.emit(AppMsg::Page(PageCmd::Step(dir))));
+            view.connect_pages_wanted(move |pages, keep| {
+                s.emit(AppMsg::PagesWanted { pages, keep })
+            });
+            let s = self.sender.clone();
+            view.connect_page_shown(move |page| s.emit(AppMsg::PageShown(page)));
             let s = self.sender.clone();
             view.connect_zoom_changed(move |zoom| s.emit(AppMsg::ZoomChanged(zoom)));
             self.stack.add_named(&page.widget(), Some(ImagePage::NAME));
@@ -136,13 +140,20 @@ impl Views {
         self.image().set_image(texture, size);
     }
 
-    pub fn show_pdf_page(
-        &mut self,
-        texture: &gdk::Texture,
-        size_pt: (f64, f64),
-        flip: Option<i32>,
-    ) {
-        self.image().set_pdf_page(texture, size_pt, flip);
+    pub fn show_pdf_page(&mut self, texture: &gdk::Texture, size_pt: (f64, f64)) {
+        self.image().set_pdf_page(texture, size_pt);
+    }
+
+    pub fn set_pdf_layout(&self, sizes_pt: &[(f64, f64)]) {
+        if let Some(image) = self.image_visible() {
+            image.set_pdf_layout(sizes_pt);
+        }
+    }
+
+    pub fn set_pdf_page_texture(&self, index: u32, texture: &gdk::Texture) {
+        if let Some(image) = self.image_visible() {
+            image.set_pdf_page_texture(index, texture);
+        }
     }
 
     /// Sharper pixels for the image or page on screen.
@@ -157,13 +168,6 @@ impl Views {
         if let Some(image) = self.image_visible() {
             image.view().apply(cmd);
         }
-    }
-
-    /// The image page's zoom (`None`: fitted) and device scale.
-    pub fn zoom_state(&self) -> (Option<f64>, f64) {
-        self.image.as_ref().map_or((None, 1.0), |image| {
-            (image.view().free_zoom(), image.view().device_scale())
-        })
     }
 
     pub fn show_text(&mut self, text: &str, truncated: bool) {

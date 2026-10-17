@@ -1,5 +1,5 @@
 use super::Page;
-use super::zoom::{FitMode, ZoomView};
+use super::zoom::{FitMode, Pages, ZoomView};
 use gtk::gdk;
 use gtk::prelude::*;
 
@@ -47,14 +47,23 @@ impl ImagePage {
             .set(texture, size, FitMode::ScaleDown, false, false);
     }
 
-    /// `flip`: the direction we paged in from, to keep the zoom across pages; `None` for a
-    /// newly opened document.
-    pub fn set_pdf_page(&self, texture: &gdk::Texture, (w, h): (f64, f64), flip: Option<i32>) {
-        let size = (w * PX_PER_PT, h * PX_PER_PT);
-        match flip {
-            Some(dir) => self.view.set_page(texture, size, dir),
-            None => self.view.set(texture, size, FitMode::Contain, true, false),
-        }
+    /// Page 1 of a PDF, fitted to the window; the rest follows via `set_pdf_layout`.
+    pub fn set_pdf_page(&self, texture: &gdk::Texture, size_pt: (f64, f64)) {
+        let size = (size_pt.0 * PX_PER_PT, size_pt.1 * PX_PER_PT);
+        self.view.set(texture, size, FitMode::Contain, true, false);
+    }
+
+    /// Every page's size in points: what the continuous view needs.
+    pub fn set_pdf_layout(&self, sizes_pt: &[(f64, f64)]) {
+        let sizes = sizes_pt
+            .iter()
+            .map(|&(w, h)| (w * PX_PER_PT, h * PX_PER_PT))
+            .collect();
+        self.view.set_layout(Pages::new(sizes));
+    }
+
+    pub fn set_pdf_page_texture(&self, index: u32, texture: &gdk::Texture) {
+        self.view.set_page_texture(index, texture);
     }
 
     pub fn set_detail(&self, texture: &gdk::Texture) {

@@ -1,14 +1,17 @@
 //! The previewer window: one relm4 component, kept alive (hidden) for the daemon's life.
 
 use crate::kind::{self, Kind};
-use crate::load::{self, Detail, DetailJob, Job, Meta, Payload, Pixels, Target};
+use crate::load::{self, Detail, DetailJob, Job, Meta, PageJob, Payload, Pixels, Target};
 use crate::session::Session;
 use crate::view::{PAN_STEP, Views, ZoomCmd, format_size};
 use adw::prelude::*;
 use flux_preview::ipc::{self, Request};
 use relm4::prelude::*;
+use std::collections::HashMap;
+use std::ops::Range;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const DEFAULT_SIZE: (i32, i32) = (960, 680);
@@ -52,11 +55,29 @@ pub enum AppMsg {
     Detail {
         id: u64,
         generation: u64,
-        flip: Option<i32>,
         payload: Payload,
     },
     /// `None`: fitted to the window.
     ZoomChanged(Option<f64>),
+    /// Every page's size in points; arrives right after page 1.
+    PdfLayout {
+        id: u64,
+        sizes: Vec<(f64, f64)>,
+    },
+    /// The continuous view wants these pages at these widths; only `keep` is worth
+    /// rendering any more.
+    PagesWanted {
+        pages: Vec<(u32, i32)>,
+        keep: Range<u32>,
+    },
+    PdfPage {
+        id: u64,
+        index: u32,
+        width: i32,
+        pixels: Option<Pixels>,
+    },
+    /// The page in the middle of the continuous view.
+    PageShown(u32),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -91,6 +112,10 @@ impl AppMsg {
             AppMsg::DetailWanted(..) => "DetailWanted",
             AppMsg::Detail { .. } => "Detail",
             AppMsg::ZoomChanged(_) => "ZoomChanged",
+            AppMsg::PdfLayout { .. } => "PdfLayout",
+            AppMsg::PagesWanted { .. } => "PagesWanted",
+            AppMsg::PdfPage { .. } => "PdfPage",
+            AppMsg::PageShown(_) => "PageShown",
         }
     }
 }
@@ -105,19 +130,21 @@ pub struct App {
     has_content: bool,
     /// The full preview is on screen; late thumbnails must not cover it.
     has_full: bool,
-    /// Page flips and zoom renders within the current file; bumped by each new one and by
-    /// every file change, so only the latest lands.
+    /// Zoom renders within the current file; bumped by each new one and by every file
+    /// change, so only the latest lands.
     generations: Session,
     kind: Option<Kind>,
     /// Kind, size and dimensions, for the subtitle.
     summary: Vec<String>,
     zoom: Option<f64>,
-    /// PDF: the page on screen (0-based) of `pages`, and its size in points.
+    /// PDF: the page on screen (0-based) of `pages`, and page 1's size in points.
     page: i32,
     pages: i32,
     page_size: (f64, f64),
-    /// A page flip is rendering; zoom renders for the old page would replace it.
-    flipping: bool,
+    /// Continuous view: renders queued per page (at this width), and the pages still
+    /// worth rendering, shared with the queued jobs.
+    in_flight: HashMap<u32, i32>,
+    keep: Arc<Mutex<Range<u32>>>,
     /// Widest texture (device px) on screen or asked for; `i32::MAX` once nothing
     /// sharper exists.
     detail: i32,
@@ -188,7 +215,8 @@ impl Component for App {
             page: 0,
             pages: 0,
             page_size: (0.0, 0.0),
-            flipping: false,
+            in_flight: HashMap::new(),
+            keep: Arc::new(Mutex::new(0..0)),
             detail: 0,
         };
         ComponentParts { model, widgets: () }
@@ -276,20 +304,48 @@ impl Component for App {
                     self.views.zoom(cmd);
                 }
             }
-            AppMsg::Page(cmd) => self.flip_page(cmd, &sender, root),
+            AppMsg::Page(cmd) => {
+                if root.is_visible() && self.kind == Some(Kind::Pdf) {
+                    self.views.zoom(ZoomCmd::Page(cmd));
+                }
+            }
             AppMsg::DetailWanted(w, h) => self.want_detail(w, h, &sender),
             AppMsg::Detail {
                 id,
                 generation,
-                flip,
                 payload,
             } => {
                 if self.session.is_current(id) && self.generations.is_current(generation) {
-                    self.show_detail(flip, payload);
+                    self.show_detail(payload);
                 }
             }
             AppMsg::ZoomChanged(zoom) => {
                 self.zoom = zoom;
+                self.refresh_subtitle();
+            }
+            AppMsg::PdfLayout { id, sizes } => {
+                if self.session.is_current(id) {
+                    self.views.set_pdf_layout(&sizes);
+                }
+            }
+            AppMsg::PagesWanted { pages, keep } => self.want_pages(pages, keep, &sender),
+            AppMsg::PdfPage {
+                id,
+                index,
+                width,
+                pixels,
+            } => {
+                if self.session.is_current(id) {
+                    if self.in_flight.get(&index) == Some(&width) {
+                        self.in_flight.remove(&index);
+                    }
+                    if let Some(pixels) = pixels {
+                        self.views.set_pdf_page_texture(index, &pixels.texture());
+                    }
+                }
+            }
+            AppMsg::PageShown(page) => {
+                self.page = page as i32;
                 self.refresh_subtitle();
             }
         }
@@ -409,7 +465,7 @@ impl App {
                 self.pages = pages;
                 self.page_size = size;
                 self.detail = page.width();
-                self.views.show_pdf_page(&page.texture(), size, None);
+                self.views.show_pdf_page(&page.texture(), size);
             }
             Payload::Text { text, truncated } => self.views.show_text(&text, truncated),
             Payload::Video => self.views.show_video(&path),
@@ -431,42 +487,43 @@ impl App {
         self.refresh_subtitle();
     }
 
-    /// Renders another page of the PDF on screen. The old page stays up until it lands,
-    /// rendered at the current zoom so it arrives sharp.
-    fn flip_page(&mut self, cmd: PageCmd, sender: &ComponentSender<Self>, root: &adw::Window) {
-        if self.kind != Some(Kind::Pdf) || !self.has_full || self.pages < 2 || !root.is_visible() {
+    /// Queues renders for the continuous view, skipping pages already rendering at that
+    /// width or wider.
+    fn want_pages(
+        &mut self,
+        pages: Vec<(u32, i32)>,
+        keep: Range<u32>,
+        sender: &ComponentSender<Self>,
+    ) {
+        if self.kind != Some(Kind::Pdf) {
             return;
         }
-        let last = self.pages - 1;
-        let page = match cmd {
-            PageCmd::Step(delta) => (self.page + delta).clamp(0, last),
-            PageCmd::First => 0,
-            PageCmd::Last => last,
-        };
-        if page == self.page {
+        let Some(path) = self.current().map(Path::to_path_buf) else {
             return;
-        }
-        let flip = (page - self.page).signum();
-        self.page = page;
-        self.flipping = true;
-        self.refresh_subtitle();
-
-        let target = match self.views.zoom_state() {
-            (Some(zoom), device) => Target::Scale(zoom * device * 96.0 / 72.0),
-            (None, _) => Target::Fit(window_target(root)),
         };
-        self.spawn_detail(
-            Detail::Page {
-                index: page,
-                target,
-            },
-            Some(flip),
-            sender,
-        );
+        if let Ok(mut shared) = self.keep.lock() {
+            *shared = keep.clone();
+        }
+        // Jobs for pages outside `keep` skip themselves; forget them here too.
+        self.in_flight.retain(|i, _| keep.contains(i));
+        for (index, width) in pages {
+            if self.in_flight.get(&index).is_some_and(|&w| w >= width) {
+                continue;
+            }
+            self.in_flight.insert(index, width);
+            let job = PageJob {
+                id: self.session.current(),
+                path: path.clone(),
+                index,
+                width,
+                keep: self.keep.clone(),
+            };
+            load::spawn_page(job, self.session.clone(), sender.input_sender().clone());
+        }
     }
 
     fn want_detail(&mut self, w: i32, _h: i32, sender: &ComponentSender<Self>) {
-        if !self.has_full || self.flipping || w <= self.detail {
+        if !self.has_full || w <= self.detail {
             return;
         }
         let detail = match self.kind {
@@ -474,19 +531,20 @@ impl App {
                 self.detail = i32::MAX;
                 Detail::Full
             }
+            // Only the single-page view asks this way, so it is always page 1.
             Some(Kind::Pdf) if self.page_size.0 > 0.0 => {
                 self.detail = w;
                 Detail::Page {
-                    index: self.page,
+                    index: 0,
                     target: Target::Scale(w as f64 / self.page_size.0),
                 }
             }
             _ => return,
         };
-        self.spawn_detail(detail, None, sender);
+        self.spawn_detail(detail, sender);
     }
 
-    fn spawn_detail(&self, detail: Detail, flip: Option<i32>, sender: &ComponentSender<Self>) {
+    fn spawn_detail(&self, detail: Detail, sender: &ComponentSender<Self>) {
         let Some(path) = self.current().map(Path::to_path_buf) else {
             return;
         };
@@ -495,7 +553,6 @@ impl App {
             generation: self.generations.bump(),
             path,
             detail,
-            flip,
         };
         load::spawn_detail(
             job,
@@ -505,25 +562,11 @@ impl App {
         );
     }
 
-    fn show_detail(&mut self, flip: Option<i32>, payload: Payload) {
+    fn show_detail(&mut self, payload: Payload) {
         match payload {
             Payload::Image { pixels, .. } => self.views.set_detail(&pixels.texture()),
-            Payload::Pdf {
-                page, index, size, ..
-            } if index == self.page => {
-                if flip.is_some() {
-                    self.flipping = false;
-                    self.page_size = size;
-                    self.detail = page.width();
-                    self.views.show_pdf_page(&page.texture(), size, flip);
-                } else {
-                    self.views.set_detail(&page.texture());
-                }
-            }
-            Payload::Error(err) => {
-                self.flipping = false;
-                eprintln!("[flux-preview] render failed: {err}");
-            }
+            Payload::Pdf { page, .. } => self.views.set_detail(&page.texture()),
+            Payload::Error(err) => eprintln!("[flux-preview] render failed: {err}"),
             _ => {}
         }
     }
@@ -539,7 +582,9 @@ impl App {
         self.page = 0;
         self.pages = 0;
         self.page_size = (0.0, 0.0);
-        self.flipping = false;
+        self.in_flight.clear();
+        // A fresh range: jobs still queued for the old file see an empty one.
+        self.keep = Arc::new(Mutex::new(0..0));
         self.detail = 0;
     }
 

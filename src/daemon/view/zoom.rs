@@ -4,11 +4,17 @@
 //! ScrolledWindow, so zooming never waits for a layout pass and the point under the
 //! cursor stays exactly put. The texture is always stretched over the content rect, so a
 //! sharper decode can be swapped in without the view moving.
+//!
+//! PDFs open as a single page (fast); the first scroll down turns the same canvas into a
+//! continuous document: the pages stacked vertically, each rendered only near the view.
 
+use crate::app::PageCmd;
 use gtk::prelude::*;
 use gtk::subclass::prelude::*;
 use gtk::{gdk, graphene, gsk};
 use std::cell::RefCell;
+use std::collections::HashMap;
+use std::ops::Range;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -18,8 +24,12 @@ const STEP: f64 = 1.25;
 /// Keyboard pan, in screen px.
 pub const PAN_STEP: f64 = 64.0;
 const WHEEL_PAN: f64 = 48.0;
-/// Touchpad: scrolling this far against a page edge flips the page.
-const FLIP_OVERSCROLL: f64 = 120.0;
+/// Between pages of a document, in content px.
+const PAGE_GAP: f64 = 16.0;
+/// Document mode: how often the visible pages are checked while scrolling.
+const PAGES_THROTTLE: Duration = Duration::from_millis(50);
+/// Pages kept rendered on either side of what is visible.
+const KEEP_AROUND: u32 = 3;
 /// Only ask for sharper pixels once zooming pauses this long (ZAP §3).
 const DETAIL_DELAY: Duration = Duration::from_millis(150);
 /// Ask for sharper pixels once the screen shows this many device px per texel.
@@ -33,12 +43,14 @@ pub enum Zoom {
     Free(f64),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FitMode {
     /// Images: never upscaled to fit.
     ScaleDown,
     /// PDF pages and placeholders: always fill the window.
     Contain,
+    /// Documents: one page of this size fills the window, not the whole stack.
+    Page(f64, f64),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -49,6 +61,8 @@ pub enum ZoomCmd {
     Actual,
     /// Move the view by screen px.
     Pan(f64, f64),
+    /// PDFs: jump between pages (switching to the continuous view).
+    Page(PageCmd),
 }
 
 /// The zoom/pan math, free of GTK so it can be tested.
@@ -83,10 +97,19 @@ impl Viewport {
     }
 
     pub fn fit_scale(&self) -> f64 {
-        let s = (self.view.0 / self.content.0).min(self.view.1 / self.content.1);
+        let fit = |(w, h): (f64, f64)| (self.view.0 / w).min(self.view.1 / h);
         match self.fit {
-            FitMode::ScaleDown => s.min(1.0),
-            FitMode::Contain => s,
+            FitMode::ScaleDown => fit(self.content).min(1.0),
+            FitMode::Contain => fit(self.content),
+            FitMode::Page(w, h) => fit((w.max(1.0), h.max(1.0))),
+        }
+    }
+
+    /// Documents may zoom out to several pages a screen; everything else stops at fit.
+    fn min_scale(&self) -> f64 {
+        match self.fit {
+            FitMode::Page(..) => self.fit_scale() / 4.0,
+            _ => self.fit_scale().min(1.0),
         }
     }
 
@@ -116,7 +139,7 @@ impl Viewport {
     pub fn zoom_to(&mut self, scale: f64, anchor: (f64, f64)) {
         let old = self.scale();
         let fit = self.fit_scale();
-        let new = scale.clamp(fit.min(1.0), MAX_ZOOM);
+        let new = scale.clamp(self.min_scale(), MAX_ZOOM);
         let a = (anchor.0 - self.view.0 / 2.0, anchor.1 - self.view.1 / 2.0);
         let p = (self.center.0 + a.0 / old, self.center.1 + a.1 / old);
         self.center = (p.0 - a.0 / new, p.1 - a.1 / new);
@@ -150,12 +173,6 @@ impl Viewport {
         )
     }
 
-    /// Shows the top (`dir > 0`, arrived going forward) or bottom edge of the content.
-    pub fn enter_from(&mut self, dir: i32) {
-        self.center.1 = if dir > 0 { 0.0 } else { self.content.1 };
-        self.clamp();
-    }
-
     fn clamp(&mut self) {
         let s = self.scale();
         self.center.0 = clamp_axis(self.center.0, self.content.0, self.view.0 / s);
@@ -172,9 +189,92 @@ fn clamp_axis(center: f64, content: f64, visible: f64) -> f64 {
     }
 }
 
+/// A document's pages stacked top to bottom, centered horizontally, in content px.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pages {
+    sizes: Vec<(f64, f64)>,
+    tops: Vec<f64>,
+    width: f64,
+    height: f64,
+    largest: (f64, f64),
+}
+
+impl Pages {
+    pub fn new(sizes: Vec<(f64, f64)>) -> Self {
+        let mut tops = Vec::with_capacity(sizes.len());
+        let mut y = 0.0;
+        let (mut width, mut largest_h) = (1.0f64, 1.0f64);
+        for &(w, h) in &sizes {
+            tops.push(y);
+            y += h + PAGE_GAP;
+            width = width.max(w);
+            largest_h = largest_h.max(h);
+        }
+        Self {
+            sizes,
+            tops,
+            width,
+            height: (y - PAGE_GAP).max(1.0),
+            largest: (width, largest_h),
+        }
+    }
+
+    pub fn len(&self) -> u32 {
+        self.sizes.len() as u32
+    }
+
+    pub fn size(&self) -> (f64, f64) {
+        (self.width, self.height)
+    }
+
+    /// `(x, y, w, h)` of page `i`.
+    pub fn rect(&self, i: u32) -> (f64, f64, f64, f64) {
+        let (w, h) = self.sizes[i as usize];
+        ((self.width - w) / 2.0, self.tops[i as usize], w, h)
+    }
+
+    /// The page at height `y`; a gap belongs to the page above it.
+    pub fn page_at(&self, y: f64) -> u32 {
+        let after = self.tops.partition_point(|&top| top <= y);
+        after
+            .saturating_sub(1)
+            .min(self.sizes.len().saturating_sub(1)) as u32
+    }
+
+    /// The pages overlapping `y0..y1`.
+    pub fn range(&self, y0: f64, y1: f64) -> Range<u32> {
+        self.page_at(y0)..self.page_at(y1) + 1
+    }
+}
+
+/// Continuous-view state: the layout plus whichever pages are rendered.
+pub struct Doc {
+    pages: Pages,
+    textures: HashMap<u32, gdk::Texture>,
+    /// Widest render asked for per page, so one isn't asked for twice.
+    asked: HashMap<u32, i32>,
+    current: u32,
+    keep: Range<u32>,
+}
+
 type DetailFn = Rc<dyn Fn(i32, i32)>;
-type PageFn = Rc<dyn Fn(i32)>;
+type PagesFn = Rc<dyn Fn(Vec<(u32, i32)>, Range<u32>)>;
+type PageFn = Rc<dyn Fn(u32)>;
 type ZoomFn = Rc<dyn Fn(Option<f64>)>;
+
+/// Linear, mipmapped when shrinking a lot, hard pixel edges when zoomed far in.
+fn filter_for(per_texel: f64, smooth: bool) -> gsk::ScalingFilter {
+    if smooth || per_texel < NEAREST_FROM {
+        if per_texel < 0.5 {
+            // Mipmapped: big photos shrunk to the window stay smooth.
+            gsk::ScalingFilter::Trilinear
+        } else {
+            gsk::ScalingFilter::Linear
+        }
+    } else {
+        gsk::ScalingFilter::Nearest
+    }
+}
 
 mod imp {
     use super::*;
@@ -184,21 +284,25 @@ mod imp {
         pub vp: Viewport,
         pub texture: Option<gdk::Texture>,
         pub placeholder: bool,
-        /// PDF: scrolling pans, and flips pages at the edges.
+        /// PDF: scrolling pans; scrolling down turns into the continuous view.
         pub paged: bool,
+        /// The PDF's page layout, once known; needed to go continuous.
+        pub layout: Option<Pages>,
+        pub doc: Option<Doc>,
         pub pointer: Option<(f64, f64)>,
         /// `center` when the drag started.
         pub drag_from: Option<(f64, f64)>,
         /// Scale when the pinch started.
         pub pinch_from: Option<f64>,
-        pub overscroll: f64,
     }
 
     #[derive(Default)]
     pub struct ZoomView {
         pub state: RefCell<State>,
         pub detail_timer: RefCell<Option<glib::SourceId>>,
+        pub pages_timer: RefCell<Option<glib::SourceId>>,
         pub on_detail: RefCell<Option<DetailFn>>,
+        pub on_pages: RefCell<Option<PagesFn>>,
         pub on_page: RefCell<Option<PageFn>>,
         pub on_zoom: RefCell<Option<ZoomFn>>,
     }
@@ -232,31 +336,52 @@ mod imp {
                 .set_view((width as f64, height as f64));
             // A bigger window can need a sharper texture too.
             self.obj().schedule_detail();
+            self.obj().schedule_pages();
         }
 
         fn snapshot(&self, snapshot: &gtk::Snapshot) {
             let st = self.state.borrow();
+            let s = st.vp.scale();
+            let (ox, oy) = st.vp.origin();
+            let device = self.obj().device_scale();
+            let rect = |x: f64, y: f64, w: f64, h: f64| {
+                graphene::Rect::new(
+                    (ox + x * s) as f32,
+                    (oy + y * s) as f32,
+                    (w * s) as f32,
+                    (h * s) as f32,
+                )
+            };
+
+            if let Some(doc) = &st.doc {
+                let visible = doc.pages.range(-oy / s, (st.vp.view.1 - oy) / s);
+                for i in visible {
+                    let (x, y, w, h) = doc.pages.rect(i);
+                    match doc.textures.get(&i) {
+                        Some(texture) => {
+                            let per_texel = w * s * device / texture.width().max(1) as f64;
+                            snapshot.append_scaled_texture(
+                                texture,
+                                filter_for(per_texel, false),
+                                &rect(x, y, w, h),
+                            );
+                        }
+                        // Not rendered yet: a blank page of the right size, so nothing moves.
+                        None => snapshot.append_color(&gdk::RGBA::WHITE, &rect(x, y, w, h)),
+                    }
+                }
+                return;
+            }
+
             let Some(texture) = &st.texture else {
                 return;
             };
-            let s = st.vp.scale();
-            let (x, y) = st.vp.origin();
-            let (w, h) = (st.vp.content.0 * s, st.vp.content.1 * s);
-            let per_texel = w * self.obj().device_scale() / texture.width().max(1) as f64;
-            let filter = if st.placeholder || per_texel < NEAREST_FROM {
-                if per_texel < 0.5 {
-                    // Mipmapped: big photos shrunk to the window stay smooth.
-                    gsk::ScalingFilter::Trilinear
-                } else {
-                    gsk::ScalingFilter::Linear
-                }
-            } else {
-                gsk::ScalingFilter::Nearest
-            };
+            let (w, h) = st.vp.content;
+            let per_texel = w * s * device / texture.width().max(1) as f64;
             snapshot.append_scaled_texture(
                 texture,
-                filter,
-                &graphene::Rect::new(x as f32, y as f32, w as f32, h as f32),
+                filter_for(per_texel, st.placeholder),
+                &rect(0.0, 0.0, w, h),
             );
         }
     }
@@ -292,9 +417,10 @@ impl ZoomView {
             st.texture = Some(texture.clone());
             st.placeholder = placeholder;
             st.paged = paged;
+            st.layout = None;
+            st.doc = None;
             st.drag_from = None;
             st.pinch_from = None;
-            st.overscroll = 0.0;
         }
         self.queue_draw();
         if !placeholder {
@@ -302,32 +428,56 @@ impl ZoomView {
         }
     }
 
-    /// Another page of the same document: keeps the zoom, enters from the edge it was
-    /// flipped towards.
-    pub fn set_page(&self, texture: &gdk::Texture, content: (f64, f64), dir: i32) {
-        {
-            let mut st = self.imp().state.borrow_mut();
-            st.vp.content = (content.0.max(1.0), content.1.max(1.0));
-            st.vp.center.0 = st.vp.content.0 / 2.0;
-            st.vp.enter_from(dir);
-            st.texture = Some(texture.clone());
-            st.overscroll = 0.0;
+    /// The PDF's page sizes (content px), once known. Kept until the first scroll down
+    /// or page key turns the single page into the continuous view.
+    pub fn set_layout(&self, pages: Pages) {
+        let mut st = self.imp().state.borrow_mut();
+        if st.paged && st.doc.is_none() {
+            st.layout = Some(pages);
         }
-        self.queue_draw();
-        self.schedule_detail();
     }
 
     /// Sharper pixels for what is on screen; the view does not move.
     pub fn set_texture(&self, texture: &gdk::Texture) {
-        self.imp().state.borrow_mut().texture = Some(texture.clone());
+        let in_doc = self.imp().state.borrow().doc.is_some();
+        if in_doc {
+            // A sharper page 1 asked for before going continuous.
+            self.set_page_texture(0, texture);
+        } else {
+            self.imp().state.borrow_mut().texture = Some(texture.clone());
+            self.queue_draw();
+        }
+    }
+
+    /// A rendered page for the continuous view; dropped if it scrolled out of reach or
+    /// is no sharper than what is there.
+    pub fn set_page_texture(&self, index: u32, texture: &gdk::Texture) {
+        {
+            let mut st = self.imp().state.borrow_mut();
+            let Some(doc) = st.doc.as_mut().filter(|d| d.keep.contains(&index)) else {
+                return;
+            };
+            if doc
+                .textures
+                .get(&index)
+                .is_some_and(|t| t.width() >= texture.width())
+            {
+                return;
+            }
+            doc.textures.insert(index, texture.clone());
+        }
         self.queue_draw();
     }
 
     pub fn apply(&self, cmd: ZoomCmd) {
-        let mut st = self.imp().state.borrow_mut();
-        if st.placeholder || st.texture.is_none() {
+        if !self.interactive() {
             return;
         }
+        if let ZoomCmd::Page(cmd) = cmd {
+            self.page(cmd);
+            return;
+        }
+        let mut st = self.imp().state.borrow_mut();
         let middle = (st.vp.view.0 / 2.0, st.vp.view.1 / 2.0);
         match cmd {
             ZoomCmd::In => st.vp.zoom_by(STEP, middle),
@@ -337,12 +487,81 @@ impl ZoomView {
             ZoomCmd::Pan(dx, dy) => {
                 st.vp.pan((dx, dy));
                 drop(st);
-                self.queue_draw();
+                self.moved();
                 return;
             }
+            ZoomCmd::Page(_) => unreachable!(),
         }
         drop(st);
         self.zoomed();
+    }
+
+    /// Page keys: go continuous if needed, then jump.
+    fn page(&self, cmd: PageCmd) {
+        if !self.enter_doc() {
+            return;
+        }
+        {
+            let mut st = self.imp().state.borrow_mut();
+            let st = &mut *st;
+            let Some(doc) = st.doc.as_ref() else { return };
+            let last = doc.pages.len() - 1;
+            let target = match cmd {
+                PageCmd::Step(delta) => {
+                    (doc.current as i64 + delta as i64).clamp(0, last as i64) as u32
+                }
+                PageCmd::First => 0,
+                PageCmd::Last => last,
+            };
+            // Centered if the page fits the window, else its top at the top.
+            let (_, y, _, h) = doc.pages.rect(target);
+            let visible = st.vp.view.1 / st.vp.scale();
+            st.vp.center.1 = if h <= visible {
+                y + h / 2.0
+            } else {
+                y + visible / 2.0
+            };
+            st.vp.clamp();
+        }
+        self.moved();
+    }
+
+    /// Turns the single PDF page into the continuous view, without moving it: page 1
+    /// keeps its place, scale and texture. `false` when there is nothing to continue to.
+    fn enter_doc(&self) -> bool {
+        {
+            let mut st = self.imp().state.borrow_mut();
+            if st.doc.is_some() {
+                return true;
+            }
+            if !st.paged || st.layout.as_ref().is_none_or(|p| p.len() < 2) {
+                return false;
+            }
+            let pages = st.layout.take().expect("checked above");
+            let (w, h) = pages.size();
+            let (lw, lh) = pages.largest;
+            let (view, zoom, center_y) = (st.vp.view, st.vp.zoom, st.vp.center.1);
+            st.vp = Viewport::new((w, h), FitMode::Page(lw, lh));
+            st.vp.set_view(view);
+            st.vp.zoom = zoom;
+            st.vp.center = (w / 2.0, center_y);
+            st.vp.clamp();
+            let mut textures = HashMap::new();
+            if let Some(texture) = st.texture.clone() {
+                textures.insert(0, texture);
+            }
+            let current = pages.page_at(st.vp.center.1);
+            st.doc = Some(Doc {
+                pages,
+                textures,
+                asked: HashMap::new(),
+                current,
+                keep: 0..0,
+            });
+        }
+        crate::hit!("enter_doc");
+        self.moved();
+        true
     }
 
     /// The zoom level, or `None` when fitted to the window.
@@ -368,8 +587,14 @@ impl ZoomView {
         *self.imp().on_detail.borrow_mut() = Some(Rc::new(f));
     }
 
-    /// Called with ±1 when scrolling runs past the bottom or top of a page.
-    pub fn connect_page_edge(&self, f: impl Fn(i32) + 'static) {
+    /// Continuous view: called (throttled) with the pages to render at which width in
+    /// device px, and the range worth keeping; anything outside it may be skipped.
+    pub fn connect_pages_wanted(&self, f: impl Fn(Vec<(u32, i32)>, Range<u32>) + 'static) {
+        *self.imp().on_pages.borrow_mut() = Some(Rc::new(f));
+    }
+
+    /// Continuous view: called with the page in the middle of the view when it changes.
+    pub fn connect_page_shown(&self, f: impl Fn(u32) + 'static) {
         *self.imp().on_page.borrow_mut() = Some(Rc::new(f));
     }
 
@@ -377,8 +602,14 @@ impl ZoomView {
         *self.imp().on_zoom.borrow_mut() = Some(Rc::new(f));
     }
 
-    fn zoomed(&self) {
+    /// The view moved: redraw, and see which pages it now needs.
+    fn moved(&self) {
         self.queue_draw();
+        self.schedule_pages();
+    }
+
+    fn zoomed(&self) {
+        self.moved();
         let zoom = self.free_zoom();
         let on_zoom = self.imp().on_zoom.borrow().clone();
         if let Some(f) = on_zoom {
@@ -406,6 +637,10 @@ impl ZoomView {
     fn check_detail(&self) {
         let want = {
             let st = self.imp().state.borrow();
+            // The continuous view asks per page instead.
+            if st.doc.is_some() {
+                return;
+            }
             let Some(texture) = st.texture.as_ref().filter(|_| !st.placeholder) else {
                 return;
             };
@@ -421,10 +656,81 @@ impl ZoomView {
         }
     }
 
-    fn flip(&self, dir: i32) {
+    /// At most every `PAGES_THROTTLE`, never postponed: pages keep arriving during a long
+    /// scroll instead of only once it stops.
+    fn schedule_pages(&self) {
+        let imp = self.imp();
+        if imp.state.borrow().doc.is_none() || imp.pages_timer.borrow().is_some() {
+            return;
+        }
+        let weak = self.downgrade();
+        let id = glib::timeout_add_local_once(PAGES_THROTTLE, move || {
+            if let Some(view) = weak.upgrade() {
+                view.imp().pages_timer.take();
+                view.check_pages();
+            }
+        });
+        *imp.pages_timer.borrow_mut() = Some(id);
+    }
+
+    /// Which pages need (sharper) pixels: the visible ones plus half a screen either way.
+    /// Pages further than `KEEP_AROUND` from that are dropped.
+    fn check_pages(&self) {
+        let device = self.device_scale();
+        let (wants, keep, shown) = {
+            let mut st = self.imp().state.borrow_mut();
+            let st = &mut *st;
+            let vp = st.vp;
+            let Some(doc) = st.doc.as_mut() else { return };
+            let s = vp.scale();
+            let (_, oy) = vp.origin();
+            let margin = vp.view.1 / 2.0 / s;
+            let near = doc
+                .pages
+                .range(-oy / s - margin, (vp.view.1 - oy) / s + margin);
+            let keep = near.start.saturating_sub(KEEP_AROUND)
+                ..(near.end + KEEP_AROUND).min(doc.pages.len());
+            doc.textures.retain(|i, _| keep.contains(i));
+            doc.asked.retain(|i, _| keep.contains(i));
+
+            let mut wants = Vec::new();
+            for i in near {
+                let (_, _, w, _) = doc.pages.rect(i);
+                let need = (w * s * device).ceil() as i32;
+                let have = doc.textures.get(&i).map_or(0, |t| t.width());
+                let asked = doc.asked.get(&i).copied().unwrap_or(0);
+                if (have as f64) * DETAIL_SLACK < need as f64 && asked < need {
+                    doc.asked.insert(i, need);
+                    wants.push((i, need));
+                }
+            }
+            let keep_changed = doc.keep != keep;
+            doc.keep = keep.clone();
+            // The page in the middle, except at either end: scrolled all the way down
+            // means the last page, even when the one above it holds the middle.
+            let half = vp.view.1 / 2.0 / s;
+            let current = if vp.center.1 + half >= doc.pages.size().1 - 0.5 {
+                doc.pages.len() - 1
+            } else if vp.center.1 - half <= 0.5 {
+                0
+            } else {
+                doc.pages.page_at(vp.center.1)
+            };
+            let shown = (current != doc.current).then_some(current);
+            doc.current = current;
+            (
+                (!wants.is_empty() || keep_changed).then_some(wants),
+                keep,
+                shown,
+            )
+        };
+        let on_pages = self.imp().on_pages.borrow().clone();
+        if let (Some(wants), Some(f)) = (wants, on_pages) {
+            f(wants, keep);
+        }
         let on_page = self.imp().on_page.borrow().clone();
-        if let Some(f) = on_page {
-            f(dir);
+        if let (Some(page), Some(f)) = (shown, on_page) {
+            f(page);
         }
     }
 
@@ -436,7 +742,7 @@ impl ZoomView {
 
     fn interactive(&self) -> bool {
         let st = self.imp().state.borrow();
-        !st.placeholder && st.texture.is_some()
+        !st.placeholder && (st.texture.is_some() || st.doc.is_some())
     }
 
     fn on_scroll(&self, unit: gdk::ScrollUnit, mods: gdk::ModifierType, dx: f64, dy: f64) {
@@ -463,32 +769,12 @@ impl ZoomView {
             (dx, dy)
         };
         let k = if wheel { WHEEL_PAN } else { 1.0 };
-        let mut flip = None;
-        {
-            let mut st = self.imp().state.borrow_mut();
-            let moved = st.vp.pan((dx * k, dy * k));
-            if paged && dy != 0.0 && moved.1.abs() < 0.5 {
-                if wheel {
-                    flip = Some(dy.signum() as i32);
-                } else {
-                    // Fresh direction: start over.
-                    if st.overscroll * dy < 0.0 {
-                        st.overscroll = 0.0;
-                    }
-                    st.overscroll += dy;
-                    if st.overscroll.abs() > FLIP_OVERSCROLL {
-                        flip = Some(st.overscroll.signum() as i32);
-                        st.overscroll = 0.0;
-                    }
-                }
-            } else {
-                st.overscroll = 0.0;
-            }
+        // Reading on: the single page becomes the continuous view.
+        if paged && dy > 0.0 {
+            self.enter_doc();
         }
-        self.queue_draw();
-        if let Some(dir) = flip {
-            self.flip(dir);
-        }
+        self.imp().state.borrow_mut().vp.pan((dx * k, dy * k));
+        self.moved();
     }
 
     fn toggle_zoom(&self, at: (f64, f64)) {
@@ -558,7 +844,7 @@ impl ZoomView {
                 st.vp.pan((-ox, -oy));
             }
             view.set_cursor_from_name(Some("grabbing"));
-            view.queue_draw();
+            view.moved();
         });
         let weak = self.downgrade();
         drag.connect_drag_end(move |_, _, _| {
@@ -687,13 +973,33 @@ mod tests {
     }
 
     #[test]
-    fn pages_enter_from_the_edge() {
-        let mut vp = Viewport::new((800.0, 1100.0), FitMode::Contain);
-        vp.set_view((800.0, 600.0));
-        vp.zoom_to(2.0, (400.0, 300.0));
-        vp.enter_from(1);
-        assert_eq!(vp.origin().1, 0.0);
-        vp.enter_from(-1);
-        assert_eq!(vp.origin().1 + 2200.0, 600.0);
+    fn pages_stack_with_gaps() {
+        let pages = Pages::new(vec![(100.0, 200.0), (50.0, 100.0), (100.0, 200.0)]);
+        assert_eq!(
+            pages.size(),
+            (100.0, 200.0 + 100.0 + 200.0 + 2.0 * PAGE_GAP)
+        );
+        assert_eq!(pages.rect(1), (25.0, 200.0 + PAGE_GAP, 50.0, 100.0));
+        assert_eq!(pages.page_at(-5.0), 0);
+        assert_eq!(pages.page_at(199.0), 0);
+        // In the gap: still the page above.
+        assert_eq!(pages.page_at(205.0), 0);
+        assert_eq!(pages.page_at(200.0 + PAGE_GAP), 1);
+        assert_eq!(pages.page_at(1e9), 2);
+        assert_eq!(pages.range(150.0, 250.0), 0..2);
+        assert_eq!(pages.largest, (100.0, 200.0));
+    }
+
+    #[test]
+    fn documents_fit_one_page_and_zoom_out_further() {
+        let mut vp = Viewport::new((800.0, 10_000.0), FitMode::Page(800.0, 1000.0));
+        vp.set_view((400.0, 500.0));
+        assert_eq!(vp.fit_scale(), 0.5);
+        vp.zoom_to(0.01, (200.0, 250.0));
+        assert_eq!(vp.zoom, Zoom::Free(0.125));
+        // Taller than the view: scrolls instead of centering.
+        vp.fit();
+        vp.pan((0.0, 1000.0));
+        assert!(vp.origin().1 < 0.0);
     }
 }

@@ -1,7 +1,9 @@
 use super::{Payload, Pixels};
 use gtk::gdk;
 use poppler::cairo;
-use std::path::Path;
+use std::cell::RefCell;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// Zoomed renders stop here; past it the page is upscaled on screen.
 const MAX_SIDE: f64 = 8192.0;
@@ -13,15 +15,63 @@ pub enum Target {
     Fit((i32, i32)),
     /// Device px per PDF point.
     Scale(f64),
+    /// This many device px wide.
+    Width(i32),
+}
+
+type Key = (PathBuf, Option<SystemTime>, u64);
+
+thread_local! {
+    /// The last document this pool thread opened: continuous scrolling renders page after
+    /// page of the same file, and reparsing it for each is the slow part.
+    static OPEN: RefCell<Option<(Key, poppler::PopplerDocument)>> = const { RefCell::new(None) };
+}
+
+fn with_doc<R>(
+    path: &Path,
+    f: impl FnOnce(&poppler::PopplerDocument) -> Result<R, String>,
+) -> Result<R, String> {
+    let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+    let key = (path.to_path_buf(), meta.modified().ok(), meta.len());
+    OPEN.with(|open| {
+        let mut open = open.borrow_mut();
+        if open.as_ref().is_none_or(|(k, _)| *k != key) {
+            *open = None;
+            let doc =
+                poppler::PopplerDocument::new_from_file(path, None).map_err(|e| e.to_string())?;
+            *open = Some((key, doc));
+        }
+        f(&open.as_ref().expect("just opened").1)
+    })
+}
+
+/// Every page's size in points, for the continuous view's layout.
+pub fn layout(path: &Path) -> Result<Vec<(f64, f64)>, String> {
+    crate::hit!("pdf_layout");
+    with_doc(path, |doc| {
+        Ok((0..doc.get_n_pages())
+            .map(|i| {
+                doc.get_page(i)
+                    .map(|p| p.get_size())
+                    .filter(|&(w, h)| w > 0.0 && h > 0.0)
+                    .unwrap_or((612.0, 792.0))
+            })
+            .collect())
+    })
 }
 
 /// One page straight to pixels. From flux `src/utils/media/pdf.rs`, minus the PNG round
 /// trip.
-///
-/// TODO: keep the document open between pages instead of reparsing it per render.
 pub fn render(path: &Path, index: i32, target: Target) -> Result<Payload, String> {
     crate::hit!("pdf");
-    let doc = poppler::PopplerDocument::new_from_file(path, None).map_err(|e| e.to_string())?;
+    with_doc(path, |doc| render_page(doc, index, target))
+}
+
+fn render_page(
+    doc: &poppler::PopplerDocument,
+    index: i32,
+    target: Target,
+) -> Result<Payload, String> {
     let pages = doc.get_n_pages() as i32;
     let index = index.clamp(0, (pages - 1).max(0));
     let page = doc.get_page(index as usize).ok_or("PDF has no pages")?;
@@ -33,6 +83,7 @@ pub fn render(path: &Path, index: i32, target: Target) -> Result<Payload, String
     let scale = match target {
         Target::Fit((tw, th)) => (tw as f64 / page_w).min(th as f64 / page_h),
         Target::Scale(scale) => scale,
+        Target::Width(w) => w as f64 / page_w,
     }
     .min(MAX_SIDE / page_w.max(page_h))
     .min((MAX_AREA / (page_w * page_h)).sqrt());

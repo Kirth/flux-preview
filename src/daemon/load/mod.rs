@@ -19,8 +19,9 @@ use crate::session::Session;
 use gdk_pixbuf::Pixbuf;
 use gtk::gdk;
 use gtk::prelude::*;
+use std::ops::Range;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::SystemTime;
 
 /// Decoded pixels, ready to become a `gdk::MemoryTexture` on the GTK thread without any
@@ -150,12 +151,69 @@ pub fn spawn(job: Job, session: Session, sender: relm4::Sender<AppMsg>) {
         };
         let payload = result.unwrap_or_else(Payload::Error);
 
+        let more_pages = matches!(payload, Payload::Pdf { pages, .. } if pages > 1);
+        if !session.is_current(id) {
+            return;
+        }
+        sender.emit(AppMsg::Loaded {
+            id,
+            kind,
+            meta,
+            payload,
+        });
+
+        // Show first (page 1), then the layout the continuous view needs. Same thread, so
+        // the document is still open.
+        if more_pages {
+            match pdf::layout(&path) {
+                Ok(sizes) if session.is_current(id) => sender.emit(AppMsg::PdfLayout { id, sizes }),
+                Ok(_) => {}
+                Err(err) => eprintln!("[flux-preview] PDF layout failed: {err}"),
+            }
+        }
+    });
+}
+
+pub struct PageJob {
+    pub id: u64,
+    pub path: PathBuf,
+    pub index: u32,
+    /// Device px wide.
+    pub width: i32,
+    /// The pages still worth rendering; scrolled-past ones are skipped.
+    pub keep: Arc<Mutex<Range<u32>>>,
+}
+
+/// Renders one page for the continuous view, then posts `AppMsg::PdfPage`.
+pub fn spawn_page(job: PageJob, session: Session, sender: relm4::Sender<AppMsg>) {
+    pool().spawn(move || {
+        let PageJob {
+            id,
+            path,
+            index,
+            width,
+            keep,
+        } = job;
+        let wanted =
+            || session.is_current(id) && keep.lock().map(|k| k.contains(&index)).unwrap_or(false);
+        if !wanted() {
+            return;
+        }
+        crate::hit!("pdf_page");
+        let pixels = match pdf::render(&path, index as i32, Target::Width(width)) {
+            Ok(Payload::Pdf { page, .. }) => Some(page),
+            Ok(_) => None,
+            Err(err) => {
+                eprintln!("[flux-preview] page {} failed: {err}", index + 1);
+                None
+            }
+        };
         if session.is_current(id) {
-            sender.emit(AppMsg::Loaded {
+            sender.emit(AppMsg::PdfPage {
                 id,
-                kind,
-                meta,
-                payload,
+                index,
+                width,
+                pixels,
             });
         }
     });
@@ -173,12 +231,10 @@ pub enum Detail {
 
 pub struct DetailJob {
     pub id: u64,
-    /// The view generation: page flips and zooms bump it, dropping older renders.
+    /// The view generation: each request bumps it, dropping older renders.
     pub generation: u64,
     pub path: PathBuf,
     pub detail: Detail,
-    /// Passed back untouched: the direction of the page flip this render is for.
-    pub flip: Option<i32>,
 }
 
 /// Decodes `job` on the pool, then posts `AppMsg::Detail`.
@@ -194,7 +250,6 @@ pub fn spawn_detail(
             generation,
             path,
             detail,
-            flip,
         } = job;
         let current = || session.is_current(id) && generations.is_current(generation);
         if !current() {
@@ -209,7 +264,6 @@ pub fn spawn_detail(
             sender.emit(AppMsg::Detail {
                 id,
                 generation,
-                flip,
                 payload: result.unwrap_or_else(Payload::Error),
             });
         }

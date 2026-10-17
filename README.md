@@ -3,7 +3,7 @@
 QuickLook for Linux: press space in a file manager, see the file. A spinoff of flux, built on the
 rules in [ZAP.txt](ZAP.txt).
 
-Previews images, text, HTML (WebKitGTK, JS and network off), PDF (page by page), video and audio
+Previews images, text, HTML (WebKitGTK, JS and network off), PDF (page 1 first, then continuous scrolling), video and audio
 (GStreamer), archive contents, with an info page for everything else.
 
 Archives show a summary (files, folders, unpacked size, ratio, encryption) and an expandable
@@ -29,7 +29,7 @@ Images and PDFs zoom and pan:
 | Zoom | wheel, pinch, <kbd>+</kbd>/<kbd>-</kbd> | <kbd>Ctrl</kbd>+wheel, pinch, <kbd>+</kbd>/<kbd>-</kbd> |
 | Fit / 100% | <kbd>0</kbd> / <kbd>1</kbd>, double-click toggles | same (double-click: fit ↔ 2×) |
 | Pan | drag, touchpad scroll, <kbd>↑</kbd><kbd>↓</kbd> <kbd>j</kbd><kbd>k</kbd>, <kbd>Shift</kbd>+<kbd>←</kbd><kbd>→</kbd> | drag, wheel, same keys |
-| Pages | | <kbd>PgUp</kbd>/<kbd>PgDn</kbd>, <kbd>Home</kbd>/<kbd>End</kbd>, scroll past the edge |
+| Pages | | scroll down to read on; <kbd>PgUp</kbd>/<kbd>PgDn</kbd>, <kbd>Home</kbd>/<kbd>End</kbd> jump |
 
 <kbd>←</kbd>/<kbd>→</kbd> always switch files, zoomed or not.
 
@@ -51,8 +51,12 @@ Images and PDFs zoom and pan:
   so; external listers are killed after 10 s or when you move on.
 - **Sharper only when zoomed.** Zoom is one transform in `snapshot()`, never a relayout. 150 ms
   after zooming stops, if the screen shows more pixels than the texture has, the full image
-  (≤ 64 MP) or a re-render of the page (≤ 8192 px) replaces it in place. Page flips and zoom
-  renders carry their own generation id on top of the session id.
+  (≤ 64 MP) or a re-render of the page (≤ 8192 px) replaces it in place.
+- **PDFs: one page, then only what's near.** A PDF opens as page 1 at window size; every page's
+  size is read right after it's on screen. The first scroll down turns the same canvas into a
+  continuous document without moving page 1. From then on only pages within half a screen are
+  rendered (at the zoom they're shown at), pages you scroll past are skipped before they start,
+  and textures more than 3 pages away are dropped. Each pool thread keeps its document open.
 - **Lazy pages.** Each viewer is built the first time it's needed. The WebView is warmed 75 ms
   after startup.
 - **Measured.** `hit!()` probes from flux (`FLUX_PREVIEW_HWGA_OUT=auto|path`, debug builds), and
@@ -84,7 +88,6 @@ src/daemon/hwga/              probes copied from flux
 - Keep the thumbnail on screen until the first video frame arrives
 - Syntax highlighting (gtksourceview5) and Markdown rendering
 - Animated GIF/WebP
-- PDF: prefetch pages n±1; keep the `PopplerDocument` open between renders
 - Tiled rendering for zooms past the 64 MP / 8192 px caps
 - Replace the dead-proxy network block with a compiled WebKit content filter
 - Validate thumbnails via `Thumb::MTime`
