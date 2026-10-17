@@ -58,7 +58,11 @@ pub enum ZoomCmd {
     In,
     Out,
     Fit,
+    /// The widest page (or the image) spans the view.
+    FitWidth,
     Actual,
+    /// This zoom level; 1.0 is 100%.
+    Set(f64),
     /// Move the view by screen px.
     Pan(f64, f64),
     /// PDFs: jump between pages (switching to the continuous view).
@@ -153,6 +157,11 @@ impl Viewport {
 
     pub fn zoom_by(&mut self, factor: f64, anchor: (f64, f64)) {
         self.zoom_to(self.scale() * factor, anchor);
+    }
+
+    pub fn fit_width(&mut self) {
+        let middle = (self.view.0 / 2.0, self.view.1 / 2.0);
+        self.zoom_to(self.view.0 / self.content.0, middle);
     }
 
     pub fn fit(&mut self) {
@@ -261,6 +270,18 @@ type DetailFn = Rc<dyn Fn(i32, i32)>;
 type PagesFn = Rc<dyn Fn(Vec<(u32, i32)>, Range<u32>)>;
 type PageFn = Rc<dyn Fn(u32)>;
 type ZoomFn = Rc<dyn Fn(Option<f64>)>;
+type LinkFn = Rc<dyn Fn(Option<(u32, usize)>)>;
+type SelectFn = Rc<dyn Fn(PagePoint, PagePoint, bool)>;
+
+/// A point on a page: its index and content px from its top-left corner.
+pub type PagePoint = (u32, (f64, f64));
+
+/// `(x, y, w, h)` in content px, relative to its page's top-left corner.
+pub type Rect = (f64, f64, f64, f64);
+
+const HIGHLIGHT: gdk::RGBA = gdk::RGBA::new(1.0, 0.85, 0.0, 0.35);
+const HIGHLIGHT_CURRENT: gdk::RGBA = gdk::RGBA::new(1.0, 0.45, 0.0, 0.55);
+const SELECTION: gdk::RGBA = gdk::RGBA::new(0.21, 0.52, 0.89, 0.35);
 
 /// Linear, mipmapped when shrinking a lot, hard pixel edges when zoomed far in.
 fn filter_for(per_texel: f64, smooth: bool) -> gsk::ScalingFilter {
@@ -294,6 +315,17 @@ mod imp {
         pub drag_from: Option<(f64, f64)>,
         /// Scale when the pinch started.
         pub pinch_from: Option<f64>,
+        /// Search matches per page, and the selected one as (page, index).
+        pub highlights: HashMap<u32, Vec<Rect>>,
+        pub current_hit: Option<(u32, usize)>,
+        /// Selected text, as boxes per page.
+        pub selection: HashMap<u32, Vec<Rect>>,
+        /// Clickable areas per page.
+        pub links: HashMap<u32, Vec<Rect>>,
+        /// Plain drags select text instead of panning.
+        pub select_mode: bool,
+        /// Where the text selection being dragged started.
+        pub select_from: Option<PagePoint>,
     }
 
     #[derive(Default)]
@@ -305,6 +337,8 @@ mod imp {
         pub on_pages: RefCell<Option<PagesFn>>,
         pub on_page: RefCell<Option<PageFn>>,
         pub on_zoom: RefCell<Option<ZoomFn>>,
+        pub on_link: RefCell<Option<LinkFn>>,
+        pub on_select: RefCell<Option<SelectFn>>,
     }
 
     #[glib::object_subclass]
@@ -353,6 +387,21 @@ mod imp {
                 )
             };
 
+            let highlights = |page: u32, px: f64, py: f64| {
+                for &(x, y, w, h) in st.selection.get(&page).into_iter().flatten() {
+                    snapshot.append_color(&SELECTION, &rect(px + x, py + y, w, h));
+                }
+                for (n, &(x, y, w, h)) in st.highlights.get(&page).into_iter().flatten().enumerate()
+                {
+                    let color = if st.current_hit == Some((page, n)) {
+                        &HIGHLIGHT_CURRENT
+                    } else {
+                        &HIGHLIGHT
+                    };
+                    snapshot.append_color(color, &rect(px + x, py + y, w, h));
+                }
+            };
+
             if let Some(doc) = &st.doc {
                 let visible = doc.pages.range(-oy / s, (st.vp.view.1 - oy) / s);
                 for i in visible {
@@ -369,6 +418,7 @@ mod imp {
                         // Not rendered yet: a blank page of the right size, so nothing moves.
                         None => snapshot.append_color(&gdk::RGBA::WHITE, &rect(x, y, w, h)),
                     }
+                    highlights(i, x, y);
                 }
                 return;
             }
@@ -383,6 +433,9 @@ mod imp {
                 filter_for(per_texel, st.placeholder),
                 &rect(0.0, 0.0, w, h),
             );
+            if st.paged {
+                highlights(0, 0.0, 0.0);
+            }
         }
     }
 }
@@ -421,6 +474,11 @@ impl ZoomView {
             st.doc = None;
             st.drag_from = None;
             st.pinch_from = None;
+            st.highlights.clear();
+            st.current_hit = None;
+            st.selection.clear();
+            st.links.clear();
+            st.select_from = None;
         }
         self.queue_draw();
         if !placeholder {
@@ -483,7 +541,9 @@ impl ZoomView {
             ZoomCmd::In => st.vp.zoom_by(STEP, middle),
             ZoomCmd::Out => st.vp.zoom_by(1.0 / STEP, middle),
             ZoomCmd::Fit => st.vp.fit(),
+            ZoomCmd::FitWidth => st.vp.fit_width(),
             ZoomCmd::Actual => st.vp.zoom_to(1.0, middle),
+            ZoomCmd::Set(zoom) => st.vp.zoom_to(zoom, middle),
             ZoomCmd::Pan(dx, dy) => {
                 st.vp.pan((dx, dy));
                 drop(st);
@@ -512,16 +572,132 @@ impl ZoomView {
                 }
                 PageCmd::First => 0,
                 PageCmd::Last => last,
+                PageCmd::Go(page) | PageCmd::At(page, _) => page.min(last),
             };
             // Centered if the page fits the window, else its top at the top.
             let (_, y, _, h) = doc.pages.rect(target);
             let visible = st.vp.view.1 / st.vp.scale();
-            st.vp.center.1 = if h <= visible {
+            st.vp.center.1 = if let PageCmd::At(_, at) = cmd {
+                // That spot at the top of the view, with a little room above.
+                y + (at - PAGE_GAP).max(0.0) + visible / 2.0
+            } else if h <= visible {
                 y + h / 2.0
             } else {
                 y + visible / 2.0
             };
             st.vp.clamp();
+        }
+        self.moved();
+    }
+
+    /// Search matches to draw over the pages, replacing the previous ones.
+    pub fn set_highlights(
+        &self,
+        highlights: HashMap<u32, Vec<Rect>>,
+        current: Option<(u32, usize)>,
+    ) {
+        {
+            let mut st = self.imp().state.borrow_mut();
+            st.highlights = highlights;
+            st.current_hit = current;
+        }
+        self.queue_draw();
+    }
+
+    /// The selected text's boxes per page (content px), replacing the previous ones.
+    pub fn set_selection(&self, selection: HashMap<u32, Vec<Rect>>) {
+        self.imp().state.borrow_mut().selection = selection;
+        self.queue_draw();
+    }
+
+    /// The link areas per page (content px); clicking one calls `connect_link`.
+    pub fn set_links(&self, links: HashMap<u32, Vec<Rect>>) {
+        self.imp().state.borrow_mut().links = links;
+    }
+
+    pub fn set_select_mode(&self, on: bool) {
+        self.imp().state.borrow_mut().select_mode = on;
+        self.set_cursor_from_name(on.then_some("text"));
+    }
+
+    /// The page under view point `at`, and where on it (content px, clamped to the page).
+    fn page_point(&self, (x, y): (f64, f64)) -> Option<PagePoint> {
+        let st = self.imp().state.borrow();
+        if !st.paged {
+            return None;
+        }
+        let s = st.vp.scale();
+        let (ox, oy) = st.vp.origin();
+        let (cx, cy) = ((x - ox) / s, (y - oy) / s);
+        let (page, (px, py, w, h)) = match &st.doc {
+            Some(doc) => {
+                let page = doc.pages.page_at(cy);
+                (page, doc.pages.rect(page))
+            }
+            None => (0, (0.0, 0.0, st.vp.content.0, st.vp.content.1)),
+        };
+        Some((page, ((cx - px).clamp(0.0, w), (cy - py).clamp(0.0, h))))
+    }
+
+    /// The link under view point `at`: its page and index.
+    fn link_at(&self, at: (f64, f64)) -> Option<(u32, usize)> {
+        let (page, (x, y)) = self.page_point(at)?;
+        let st = self.imp().state.borrow();
+        let i = st
+            .links
+            .get(&page)?
+            .iter()
+            .position(|&(lx, ly, lw, lh)| x >= lx && x <= lx + lw && y >= ly && y <= ly + lh)?;
+        Some((page, i))
+    }
+
+    /// Called with the link clicked, or `None` for a click elsewhere on the page.
+    pub fn connect_link(&self, f: impl Fn(Option<(u32, usize)>) + 'static) {
+        *self.imp().on_link.borrow_mut() = Some(Rc::new(f));
+    }
+
+    /// Called while a text selection is dragged (`done` false) and when it is let go.
+    pub fn connect_select(&self, f: impl Fn(PagePoint, PagePoint, bool) + 'static) {
+        *self.imp().on_select.borrow_mut() = Some(Rc::new(f));
+    }
+
+    fn emit_select(&self, at: (f64, f64), done: bool) {
+        let from = self.imp().state.borrow().select_from;
+        let on_select = self.imp().on_select.borrow().clone();
+        if let (Some(from), Some(to), Some(f)) = (from, self.page_point(at), on_select) {
+            f(from, to, done);
+        }
+    }
+
+    /// Scrolls `rect` on page `page` into view, centering it unless it is already fully
+    /// on screen. Goes continuous for any page but the first.
+    pub fn reveal(&self, page: u32, (x, y, w, h): Rect) {
+        if !self.interactive() {
+            return;
+        }
+        if page > 0 && !self.enter_doc() {
+            return;
+        }
+        {
+            let mut st = self.imp().state.borrow_mut();
+            let st = &mut *st;
+            let (px, py) = match &st.doc {
+                Some(doc) if page < doc.pages.len() => {
+                    let (px, py, _, _) = doc.pages.rect(page);
+                    (px, py)
+                }
+                Some(_) => return,
+                None => (0.0, 0.0),
+            };
+            let s = st.vp.scale();
+            let (hw, hh) = (st.vp.view.0 / 2.0 / s, st.vp.view.1 / 2.0 / s);
+            let (cx, cy) = st.vp.center;
+            let (x, y) = (px + x, py + y);
+            let inside = x >= cx - hw && x + w <= cx + hw && y >= cy - hh && y + h <= cy + hh;
+            if !inside {
+                st.vp.center = (x + w / 2.0, y + h / 2.0);
+                st.vp.clamp();
+            }
         }
         self.moved();
     }
@@ -800,7 +976,21 @@ impl ZoomView {
         let weak = self.downgrade();
         motion.connect_motion(move |_, x, y| {
             if let Some(view) = weak.upgrade() {
-                view.imp().state.borrow_mut().pointer = Some((x, y));
+                let idle = {
+                    let mut st = view.imp().state.borrow_mut();
+                    st.pointer = Some((x, y));
+                    st.drag_from.is_none() && st.select_from.is_none()
+                };
+                if idle {
+                    let cursor = if view.link_at((x, y)).is_some() {
+                        Some("pointer")
+                    } else if view.imp().state.borrow().select_mode {
+                        Some("text")
+                    } else {
+                        None
+                    };
+                    view.set_cursor_from_name(cursor);
+                }
             }
         });
         let weak = self.downgrade();
@@ -830,12 +1020,29 @@ impl ZoomView {
                 g.set_state(gtk::EventSequenceState::Denied);
                 return;
             }
+            // PDFs: Shift+drag, or any drag in select mode, selects text.
+            let shift = g
+                .current_event_state()
+                .contains(gdk::ModifierType::SHIFT_MASK);
+            let select =
+                g.current_button() == 1 && (shift || view.imp().state.borrow().select_mode);
+            if select && let Some(at) = g.start_point().and_then(|p| view.page_point(p)) {
+                view.imp().state.borrow_mut().select_from = Some(at);
+                view.set_cursor_from_name(Some("text"));
+                return;
+            }
             let mut st = view.imp().state.borrow_mut();
             st.drag_from = Some(st.vp.center);
         });
         let weak = self.downgrade();
-        drag.connect_drag_update(move |_, ox, oy| {
+        drag.connect_drag_update(move |g, ox, oy| {
             let Some(view) = weak.upgrade() else { return };
+            if view.imp().state.borrow().select_from.is_some() {
+                if let Some((x, y)) = g.start_point() {
+                    view.emit_select((x + ox, y + oy), false);
+                }
+                return;
+            }
             {
                 let mut st = view.imp().state.borrow_mut();
                 let Some(from) = st.drag_from else { return };
@@ -847,10 +1054,22 @@ impl ZoomView {
             view.moved();
         });
         let weak = self.downgrade();
-        drag.connect_drag_end(move |_, _, _| {
+        drag.connect_drag_end(move |g, ox, oy| {
             if let Some(view) = weak.upgrade() {
-                view.imp().state.borrow_mut().drag_from = None;
-                view.set_cursor_from_name(None);
+                let selecting = view.imp().state.borrow().select_from.is_some();
+                // A press without movement is a click, not a selection.
+                if selecting
+                    && (ox, oy) != (0.0, 0.0)
+                    && let Some((x, y)) = g.start_point()
+                {
+                    view.emit_select((x + ox, y + oy), true);
+                }
+                let mut st = view.imp().state.borrow_mut();
+                st.drag_from = None;
+                st.select_from = None;
+                let cursor = st.select_mode.then_some("text");
+                drop(st);
+                view.set_cursor_from_name(cursor);
             }
         });
         self.add_controller(drag);
@@ -863,6 +1082,19 @@ impl ZoomView {
                 && view.interactive()
             {
                 view.toggle_zoom((x, y));
+            }
+        });
+        // Movement past the drag threshold cancels the click: panning never follows a link.
+        let weak = self.downgrade();
+        click.connect_released(move |g, n, x, y| {
+            let Some(view) = weak.upgrade() else { return };
+            if n != 1 || g.current_button() != 1 || !view.interactive() {
+                return;
+            }
+            let link = view.link_at((x, y));
+            let on_link = view.imp().on_link.borrow().clone();
+            if let Some(f) = on_link {
+                f(link);
             }
         });
         self.add_controller(click);
@@ -988,6 +1220,19 @@ mod tests {
         assert_eq!(pages.page_at(1e9), 2);
         assert_eq!(pages.range(150.0, 250.0), 0..2);
         assert_eq!(pages.largest, (100.0, 200.0));
+    }
+
+    #[test]
+    fn fit_width_spans_the_view() {
+        let mut vp = Viewport::new((800.0, 10_000.0), FitMode::Page(800.0, 1000.0));
+        vp.set_view((400.0, 500.0));
+        vp.fit_width();
+        assert_eq!(vp.scale(), 0.5);
+        assert_eq!(vp.origin().0, 0.0);
+        let mut wide = Viewport::new((200.0, 100.0), FitMode::Contain);
+        wide.set_view((400.0, 500.0));
+        wide.fit_width();
+        assert_eq!(wide.scale(), 2.0);
     }
 
     #[test]

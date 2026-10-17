@@ -37,6 +37,17 @@ impl VideoPage {
         self.video.set_filename(Some(path));
     }
 
+    /// Fired on a double click or double tap anywhere on the video.
+    pub fn connect_double_tap(&self, f: impl Fn() + 'static) {
+        let click = gtk::GestureClick::new();
+        click.connect_pressed(move |_, n, _, _| {
+            if n == 2 {
+                f();
+            }
+        });
+        self.video.add_controller(click);
+    }
+
     pub fn stop(&self) {
         // Dropping the stream tears down the pipeline; pausing alone keeps decoders alive.
         self.video.set_media_stream(None::<&gtk::MediaStream>);

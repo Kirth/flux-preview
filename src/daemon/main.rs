@@ -8,6 +8,7 @@ mod app;
 mod hwga;
 mod kind;
 mod load;
+mod places;
 mod pool;
 mod session;
 mod thumbcache;

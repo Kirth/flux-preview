@@ -33,6 +33,21 @@ Images and PDFs zoom and pan:
 
 <kbd>←</kbd>/<kbd>→</kbd> always switch files, zoomed or not.
 
+PDFs get a bar at the bottom: page number, zoom presets (fit page, fit width, 50–400%), the
+outline (table of contents) as a sidebar, rotate, select text and find.
+
+- <kbd>Ctrl</kbd>+<kbd>F</kbd> finds text: every match is highlighted, <kbd>Enter</kbd> /
+  <kbd>Shift</kbd>+<kbd>Enter</kbd> step through them.
+- <kbd>Shift</kbd>+drag (or any drag with "Select text" on) selects text, also across pages; it
+  goes to the primary selection right away and <kbd>Ctrl</kbd>+<kbd>C</kbd> copies it.
+- Links work: within the document they jump there, web links open in the browser.
+- <kbd>R</kbd> / <kbd>Shift</kbd>+<kbd>R</kbd> rotate.
+- Reopening a PDF continues where it was left (page, zoom, rotation), from
+  `$XDG_STATE_HOME/flux-preview/pdf-places`.
+- <kbd>Esc</kbd> clears the selection first, then closes find, then hides.
+
+Double-clicking a video toggles fullscreen.
+
 ## How it stays fast
 
 - **Two binaries.** `flux-preview` is a std-only client (~2 ms). If a daemon is listening on

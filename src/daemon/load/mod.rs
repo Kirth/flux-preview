@@ -5,11 +5,13 @@ mod archive;
 mod audio;
 mod image;
 mod pdf;
+mod pdfdoc;
 mod text;
 
 pub use archive::{Listing, Node, Tree, group_digits};
 pub use audio::AudioInfo;
-pub use pdf::Target;
+pub use pdf::{Links, PagePoint, RectPt, Regions, Target, rotate_rect, rotate_size};
+pub use pdfdoc::{Dest, OutlineItem};
 pub use text::TEXT_CAP;
 
 use crate::app::AppMsg;
@@ -109,6 +111,8 @@ pub struct Job {
     pub hint: Option<Kind>,
     /// Physical pixels to decode to: the window, not the full resolution.
     pub target: (i32, i32),
+    /// PDFs: clockwise degrees.
+    pub rotation: u16,
 }
 
 /// Classifies and decodes `job` on the pool, then posts `AppMsg::Loaded`.
@@ -123,6 +127,7 @@ pub fn spawn(job: Job, session: Session, sender: relm4::Sender<AppMsg>) {
             path,
             hint,
             target,
+            rotation,
         } = job;
 
         let (kind, mime) = kind::resolve(&path, hint);
@@ -138,7 +143,7 @@ pub fn spawn(job: Job, session: Session, sender: relm4::Sender<AppMsg>) {
         }
         let result = match kind {
             Kind::Image => image::load(&path, target),
-            Kind::Pdf => pdf::render(&path, 0, Target::Fit(target)),
+            Kind::Pdf => pdf::render(&path, 0, Target::Fit(target), rotation),
             Kind::Archive => {
                 archive::load(&path, &session, id).map(|l| Payload::Archive(Box::new(l)))
             }
@@ -151,6 +156,7 @@ pub fn spawn(job: Job, session: Session, sender: relm4::Sender<AppMsg>) {
         };
         let payload = result.unwrap_or_else(Payload::Error);
 
+        let is_pdf = matches!(payload, Payload::Pdf { .. });
         let more_pages = matches!(payload, Payload::Pdf { pages, .. } if pages > 1);
         if !session.is_current(id) {
             return;
@@ -165,10 +171,20 @@ pub fn spawn(job: Job, session: Session, sender: relm4::Sender<AppMsg>) {
         // Show first (page 1), then the layout the continuous view needs. Same thread, so
         // the document is still open.
         if more_pages {
-            match pdf::layout(&path) {
+            match pdf::layout(&path, rotation) {
                 Ok(sizes) if session.is_current(id) => sender.emit(AppMsg::PdfLayout { id, sizes }),
                 Ok(_) => {}
                 Err(err) => eprintln!("[flux-preview] PDF layout failed: {err}"),
+            }
+        }
+        // Then what navigating needs: the outline and every page's links.
+        if is_pdf && session.is_current(id) {
+            match pdf::navigation(&path) {
+                Ok((outline, links)) if session.is_current(id) => {
+                    sender.emit(AppMsg::PdfNavigation { id, outline, links })
+                }
+                Ok(_) => {}
+                Err(err) => eprintln!("[flux-preview] PDF links failed: {err}"),
             }
         }
     });
@@ -182,6 +198,7 @@ pub struct PageJob {
     pub width: i32,
     /// The pages still worth rendering; scrolled-past ones are skipped.
     pub keep: Arc<Mutex<Range<u32>>>,
+    pub rotation: u16,
 }
 
 /// Renders one page for the continuous view, then posts `AppMsg::PdfPage`.
@@ -193,6 +210,7 @@ pub fn spawn_page(job: PageJob, session: Session, sender: relm4::Sender<AppMsg>)
             index,
             width,
             keep,
+            rotation,
         } = job;
         let wanted =
             || session.is_current(id) && keep.lock().map(|k| k.contains(&index)).unwrap_or(false);
@@ -200,7 +218,7 @@ pub fn spawn_page(job: PageJob, session: Session, sender: relm4::Sender<AppMsg>)
             return;
         }
         crate::hit!("pdf_page");
-        let pixels = match pdf::render(&path, index as i32, Target::Width(width)) {
+        let pixels = match pdf::render(&path, index as i32, Target::Width(width), rotation) {
             Ok(Payload::Pdf { page, .. }) => Some(page),
             Ok(_) => None,
             Err(err) => {
@@ -226,6 +244,7 @@ pub enum Detail {
     Page {
         index: i32,
         target: Target,
+        rotation: u16,
     },
 }
 
@@ -258,7 +277,11 @@ pub fn spawn_detail(
         crate::hit!("detail");
         let result = match detail {
             Detail::Full => image::load_full(&path),
-            Detail::Page { index, target } => pdf::render(&path, index, target),
+            Detail::Page {
+                index,
+                target,
+                rotation,
+            } => pdf::render(&path, index, target, rotation),
         };
         if current() {
             sender.emit(AppMsg::Detail {
@@ -266,6 +289,103 @@ pub fn spawn_detail(
                 generation,
                 payload: result.unwrap_or_else(Payload::Error),
             });
+        }
+    });
+}
+
+pub struct SearchJob {
+    pub id: u64,
+    /// Each new query bumps it, stopping the previous search.
+    pub generation: u64,
+    pub path: PathBuf,
+    pub query: String,
+}
+
+/// Searches the PDF on the pool, posting `AppMsg::SearchHits` per page with matches and
+/// `AppMsg::SearchDone` at the end.
+pub fn spawn_search(
+    job: SearchJob,
+    session: Session,
+    searches: Session,
+    sender: relm4::Sender<AppMsg>,
+) {
+    pool().spawn(move || {
+        let SearchJob {
+            id,
+            generation,
+            path,
+            query,
+        } = job;
+        let current = || session.is_current(id) && searches.is_current(generation);
+        if !current() {
+            return;
+        }
+        crate::hit!("pdf_search");
+        let result = pdf::find(
+            &path,
+            &query,
+            |page, size, rects| {
+                sender.emit(AppMsg::SearchHits {
+                    id,
+                    generation,
+                    page,
+                    size,
+                    rects,
+                });
+                current()
+            },
+            current,
+        );
+        if let Err(err) = result {
+            eprintln!("[flux-preview] search failed: {err}");
+        }
+        if current() {
+            sender.emit(AppMsg::SearchDone { id, generation });
+        }
+    });
+}
+
+pub struct SelectJob {
+    pub id: u64,
+    /// Each drag step bumps it, dropping the steps before.
+    pub generation: u64,
+    pub path: PathBuf,
+    pub from: PagePoint,
+    pub to: PagePoint,
+    /// Also extract the text: the drag ended.
+    pub text: bool,
+}
+
+/// Works out a text selection on the pool, then posts `AppMsg::Selection`.
+pub fn spawn_select(
+    job: SelectJob,
+    session: Session,
+    selections: Session,
+    sender: relm4::Sender<AppMsg>,
+) {
+    pool().spawn(move || {
+        let SelectJob {
+            id,
+            generation,
+            path,
+            from,
+            to,
+            text,
+        } = job;
+        let current = || session.is_current(id) && selections.is_current(generation);
+        if !current() {
+            return;
+        }
+        crate::hit!("pdf_select");
+        match pdf::select(&path, from, to, text) {
+            Ok((regions, text)) if current() => sender.emit(AppMsg::Selection {
+                id,
+                generation,
+                regions,
+                text,
+            }),
+            Ok(_) => {}
+            Err(err) => eprintln!("[flux-preview] selection failed: {err}"),
         }
     });
 }

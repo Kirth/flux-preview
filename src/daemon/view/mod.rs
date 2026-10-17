@@ -5,6 +5,8 @@ mod archive;
 mod image;
 mod info;
 mod media;
+mod outline;
+mod pdfbar;
 mod text;
 mod web;
 mod zoom;
@@ -12,6 +14,7 @@ mod zoom;
 use crate::app::AppMsg;
 use crate::load::{AudioInfo, Listing, Meta};
 use gtk::gdk;
+use std::collections::HashMap;
 use std::path::Path;
 
 use archive::ArchivePage;
@@ -19,9 +22,11 @@ use image::ImagePage;
 use info::InfoPage;
 pub use info::{format_size, format_unix};
 use media::{AudioPage, VideoPage};
+pub use outline::Outline;
+pub use pdfbar::PdfBar;
 use text::TextPage;
 use web::WebPage;
-pub use zoom::{PAN_STEP, ZoomCmd};
+pub use zoom::{PAN_STEP, Rect, ZoomCmd};
 
 trait Page {
     const NAME: &'static str;
@@ -112,11 +117,30 @@ impl Views {
             view.connect_page_shown(move |page| s.emit(AppMsg::PageShown(page)));
             let s = self.sender.clone();
             view.connect_zoom_changed(move |zoom| s.emit(AppMsg::ZoomChanged(zoom)));
+            let s = self.sender.clone();
+            view.connect_link(move |link| s.emit(AppMsg::LinkClicked(link)));
+            let s = self.sender.clone();
+            page.connect_pdf_select(move |from, to, done| {
+                s.emit(AppMsg::SelectDrag { from, to, done })
+            });
             self.stack.add_named(&page.widget(), Some(ImagePage::NAME));
             page
         });
         self.stack.set_visible_child_name(ImagePage::NAME);
         image
+    }
+
+    /// The video page, built (and wired to the app) on first use.
+    fn video(&mut self) -> &VideoPage {
+        let video = self.video.get_or_insert_with(|| {
+            let page = VideoPage::build();
+            let s = self.sender.clone();
+            page.connect_double_tap(move || s.emit(AppMsg::ToggleFullscreen));
+            self.stack.add_named(&page.widget(), Some(VideoPage::NAME));
+            page
+        });
+        self.stack.set_visible_child_name(VideoPage::NAME);
+        video
     }
 
     /// Whether an image or PDF page is on screen (zoom and page keys apply).
@@ -156,6 +180,46 @@ impl Views {
         }
     }
 
+    pub fn set_pdf_highlights(
+        &self,
+        pages: &HashMap<u32, Vec<Rect>>,
+        current: Option<(u32, usize)>,
+    ) {
+        if let Some(image) = self.image_visible() {
+            image.set_pdf_highlights(pages, current);
+        }
+    }
+
+    pub fn set_pdf_selection(&self, pages: &HashMap<u32, Vec<Rect>>) {
+        if let Some(image) = self.image_visible() {
+            image.set_pdf_selection(pages);
+        }
+    }
+
+    pub fn set_pdf_links(&self, pages: &HashMap<u32, Vec<Rect>>) {
+        if let Some(image) = self.image_visible() {
+            image.set_pdf_links(pages);
+        }
+    }
+
+    pub fn show_pdf_at(&self, page: u32, y: Option<f64>) {
+        if let Some(image) = self.image_visible() {
+            image.show_pdf_at(page, y);
+        }
+    }
+
+    pub fn set_select_mode(&self, on: bool) {
+        if let Some(image) = &self.image {
+            image.view().set_select_mode(on);
+        }
+    }
+
+    pub fn reveal_pdf(&self, page: u32, rect: Rect) {
+        if let Some(image) = self.image_visible() {
+            image.reveal_pdf(page, rect);
+        }
+    }
+
     /// Sharper pixels for the image or page on screen.
     pub fn set_detail(&self, texture: &gdk::Texture) {
         if let Some(image) = self.image_visible() {
@@ -175,7 +239,7 @@ impl Views {
     }
 
     pub fn show_video(&mut self, path: &Path) {
-        page(&self.stack, &mut self.video).play(path);
+        self.video().play(path);
     }
 
     pub fn show_audio(&mut self, path: &Path, info: &AudioInfo) {
